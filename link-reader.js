@@ -862,6 +862,22 @@
 .rlr-link-item .li-title { font-size: 13px; color: #3a3434; margin-top: 3px; word-break: break-all; }
 .rlr-link-item .li-url { font-size: 11px; color: #a99; margin-top: 3px; word-break: break-all; }
 .rlr-empty { font-size: 12px; color: #9a8a8a; padding: 14px; text-align: center; }
+
+.rlr-test-result {
+  margin-top: 10px; border-radius: 12px; background: rgba(255,255,255,.55);
+  border: 1.5px solid rgba(139,58,58,.12); overflow: hidden; display: none;
+}
+.rlr-test-result.show { display: block; }
+.rlr-test-result .tr-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 14px; border-bottom: 1px solid rgba(139,58,58,.10); }
+.rlr-test-result .tr-status { font-size: 12px; font-weight: 600; }
+.rlr-test-result .tr-status.ok { color: #2d8b5a; }
+.rlr-test-result .tr-status.err { color: #c0392b; }
+.rlr-test-result .tr-platform { font-size: 11px; color: #8b3a3a; font-weight: 600; }
+.rlr-test-result .tr-body { padding: 10px 14px; max-height: 300px; overflow-y: auto; }
+.rlr-test-result .tr-body pre { white-space: pre-wrap; word-break: break-all; font-size: 12px; line-height: 1.55; color: #3a3434; margin: 0; }
+.rlr-test-result .tr-title { font-size: 13px; font-weight: 600; color: #6a2f2f; margin-bottom: 4px; }
+.rlr-test-result .tr-images { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.rlr-test-result .tr-images img { width: 72px; height: 72px; object-fit: cover; border-radius: 8px; border: 1px solid rgba(139,58,58,.12); }
 .rlr-modal-mask { position: fixed; top: 0; right: 0; bottom: 0; left: 0; background: rgba(40,20,20,.35); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 10000; }
 .rlr-modal { width: min(560px, 92vw); max-height: 80vh; overflow: auto; background: rgba(255,255,255,.9); backdrop-filter: blur(20px); border-radius: 16px; padding: 20px; box-shadow: 0 16px 50px rgba(0,0,0,.2); }
 .rlr-modal pre { white-space: pre-wrap; word-break: break-all; font-size: 12px; line-height: 1.5; color: #3a3434; }
@@ -1153,6 +1169,16 @@
       '</div>' +
 
       '<div class="rlr-section">' +
+        '<div class="rlr-section-title">测试注入</div>' +
+        '<div class="rlr-desc">输入任意链接（小红书 / 微博 / B站 / 知乎 / 通用），点击测试解析，查看后端返回内容是否正常。</div>' +
+        '<div class="rlr-row">' +
+          '<input type="text" class="rlr-input" id="rlr-test-input" placeholder="粘贴链接，如 https://www.xiaohongshu.com/explore/..." />' +
+          '<button class="rlr-btn sm" id="rlr-test-btn">测试解析</button>' +
+        '</div>' +
+        '<div class="rlr-test-result" id="rlr-test-result"></div>' +
+      '</div>' +
+
+      '<div class="rlr-section">' +
         '<div class="rlr-section-title">已解析链接</div>' +
         '<div class="rlr-desc">最近解析的链接，点击查看详情。</div>' +
         '<div class="rlr-link-list" id="rlr-link-list"></div>' +
@@ -1264,6 +1290,84 @@
       showToast(root, '已清空');
     });
 
+    // 测试解析
+    root.querySelector('#rlr-test-btn').addEventListener('click', async () => {
+      const input = root.querySelector('#rlr-test-input');
+      const resultBox = root.querySelector('#rlr-test-result');
+      const btn = root.querySelector('#rlr-test-btn');
+      const link = (input.value || '').trim();
+      if (!link) { showToast(root, '请输入链接'); return; }
+
+      // 显示加载中
+      btn.disabled = true;
+      btn.textContent = '解析中...';
+      resultBox.className = 'rlr-test-result show';
+      resultBox.innerHTML = '<div class="tr-head"><span class="tr-status">解析中...</span></div><div class="tr-body"><pre>正在请求后端解析，请稍候...</pre></div>';
+
+      try {
+        const settings = await loadSettings(rocheRef);
+        const backend = settings.backend || DEFAULT_BACKEND;
+        const data = await parseLink(link, backend);
+        const platform = (data && data.platform) || detectPlatform(link) || 'general';
+
+        // 构建结果展示
+        let html = '<div class="tr-head">';
+        html += '<span class="tr-status ok">解析成功</span>';
+        html += '<span class="tr-platform">' + escapeHtml(platform) + '</span>';
+        html += '</div>';
+        html += '<div class="tr-body">';
+
+        // 标题
+        const title = (data && (data.title || data.desc || '')) || '';
+        if (title) {
+          html += '<div class="tr-title">' + escapeHtml(title.substring(0, 120)) + '</div>';
+        }
+
+        // 图片预览（小红书/微博）
+        const images = (data && data.images) || [];
+        if (images.length > 0) {
+          html += '<div class="tr-images">';
+          images.slice(0, 9).forEach(img => {
+            const imgSrc = (img && (img.url || img)) || '';
+            if (imgSrc) html += '<img src="' + escapeHtml(imgSrc) + '" alt="" onerror="this.style.display=\'none\'" />';
+          });
+          html += '</div>';
+        }
+
+        // 视频标记
+        if (data && data.video) {
+          html += '<div style="font-size:12px;color:#8b3a3a;margin-top:6px">[含视频]</div>';
+        }
+
+        // JSON 详情
+        let pretty;
+        try { pretty = JSON.stringify(data, null, 2); } catch (e) { pretty = String(data); }
+        html += '<pre style="margin-top:8px">' + escapeHtml(pretty) + '</pre>';
+        html += '</div>';
+
+        resultBox.innerHTML = html;
+
+        // 缓存到已解析链接
+        await cacheParsedLink(rocheRef, link, data);
+        await refreshPanelState(root);
+      } catch (e) {
+        const errMsg = String((e && e.message) || e);
+        resultBox.innerHTML = '<div class="tr-head"><span class="tr-status err">解析失败</span></div>' +
+          '<div class="tr-body"><pre>' + escapeHtml(errMsg) + '</pre></div>';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '测试解析';
+      }
+    });
+
+    // 回车触发测试
+    root.querySelector('#rlr-test-input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        root.querySelector('#rlr-test-btn').click();
+      }
+    });
+
     // 初始化视图
     refreshPanelState(root).then(async () => {
       const settings = await loadSettings(roche);
@@ -1314,16 +1418,15 @@
           buildPanel(container, rocheRef);
         },
         async unmount(container, roche) {
-          // 清理面板 DOM（事件监听随 DOM 一并回收）
+          // 仅清理面板 DOM（事件监听随 DOM 一并回收）
+          // 注意：不停止后台轮询、不清空已处理消息集合
+          // 保证关闭设置面板后，链接解析功能（小红书/微博直注、contextProvider、tools）继续运行
           if (container) container.innerHTML = '';
           // 删除 style 标签
           if (injectedStyleEl && injectedStyleEl.parentNode) {
             injectedStyleEl.parentNode.removeChild(injectedStyleEl);
             injectedStyleEl = null;
           }
-          // 停止后台轮询并清理已处理消息集合
-          stopPolling();
-          processedMessages.clear();
         }
       }
     ],
