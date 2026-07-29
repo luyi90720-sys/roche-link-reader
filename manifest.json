@@ -6,5 +6,10 @@
   "author": "Roche",
   "entry": "https://raw.githubusercontent.com/luyi90720-sys/roche-link-reader/main/link-reader.js",
   "hash": "",
-  "permissions": ["memory:read", "ai:chat", "storage", "ui"]
+  "permissions": [
+    "memory:read",
+    "ai:chat",
+    "storage",
+    "ui"
+  ]
 }
