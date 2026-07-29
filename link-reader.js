@@ -16,7 +16,7 @@
   const MAX_DIRECT_IMAGES = 9; // 数据库直注最多图片数
 
   // 链接检测正则
-  const LINK_REGEX = /https?:\/\/[^\s<>"']+/gi;
+  const LINK_REGEX = /https?:\/\/[^\s<>"'.,;:!?)）】》]+/gi;
   const XHS_REGEX = /https?:\/\/(xhslink\.com|xhslink\.cn|xiaohongshu\.com|xhscdn\.com)\/[^\s<>"']+/i;
   const WEIBO_REGEX = /https?:\/\/(weibo\.com|weibo\.cn|m\.weibo\.cn|t\.cn)\/[^\s<>"']+/i;
   const BILI_REGEX = /https?:\/\/(bilibili\.com|b23\.tv|bilibili\.tv)\/[^\s<>"']+/i;
@@ -41,6 +41,8 @@
   let pollTimer = null;           // 后台轮询定时器
   let currentConversationId = null; // 当前会话 id
   const processedMessages = new Set(); // 已直注处理过的消息 id
+  let _db = null;                       // IndexedDB 连接缓存
+  let dbWarned = false;                 // IndexedDB 不可用提示是否已展示
   let injectedStyleEl = null;     // mount 时插入的 style 标签
 
   // ============================ 工具函数 ============================
@@ -71,12 +73,29 @@
     });
   }
 
-  // 下载图片转 dataURL（处理 CORS，走代理）
+  // 调用 roche.ui.toast（若可用）
+  function uiToast(msg) {
+    try {
+      if (rocheRef && rocheRef.ui && typeof rocheRef.ui.toast === 'function') {
+        rocheRef.ui.toast(msg);
+      }
+    } catch (e) {}
+  }
+
+  // 下载图片转 dataURL（处理 CORS，走代理；按域名选择 referer）
   async function downloadImageAsDataUrl(imageUrl, backend) {
     const base = backend || DEFAULT_BACKEND;
+    // 根据图片域名选择 referer，提升代理成功率
+    let referer = 'https://weibo.com';
+    const lower = String(imageUrl).toLowerCase();
+    if (lower.indexOf('xhscdn.com') >= 0 || lower.indexOf('xiaohongshu.com') >= 0) {
+      referer = 'https://www.xiaohongshu.com';
+    } else if (lower.indexOf('sinaimg.cn') >= 0 || lower.indexOf('weibo.com') >= 0) {
+      referer = 'https://weibo.com';
+    }
     // 优先走 /debug 代理（携带 referer，绕过 CORS）
     try {
-      const proxyUrl = `${base}/debug?url=${encodeURIComponent(imageUrl)}&referer=https://weibo.com`;
+      const proxyUrl = `${base}/debug?url=${encodeURIComponent(imageUrl)}&referer=${encodeURIComponent(referer)}`;
       const resp = await fetch(proxyUrl);
       if (resp.ok) {
         const blob = await resp.blob();
@@ -97,7 +116,14 @@
   async function parseLink(link, backend) {
     const base = backend || DEFAULT_BACKEND;
     const url = `${base}/?url=${encodeURIComponent(link)}`;
-    const resp = await fetch(url);
+    const ctrl = new AbortController();
+    const t = setTimeout(function () { ctrl.abort(); }, 15000);
+    let resp;
+    try {
+      resp = await fetch(url, { signal: ctrl.signal });
+    } finally {
+      clearTimeout(t);
+    }
     if (!resp.ok) throw new Error('解析接口返回状态 ' + resp.status);
     const data = await resp.json();
     return data;
@@ -105,14 +131,22 @@
 
   // 调用副 API（OpenAI 兼容）
   async function callSubApi(messages, apiUrl, apiKey, model) {
-    const resp = await fetch(`${apiUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({ model, messages, temperature: 0.3, max_tokens: 200 })
-    });
+    const ctrl = new AbortController();
+    const t = setTimeout(function () { ctrl.abort(); }, 15000);
+    let resp;
+    try {
+      resp = await fetch(`${apiUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({ model, messages, temperature: 0.3, max_tokens: 200 }),
+        signal: ctrl.signal
+      });
+    } finally {
+      clearTimeout(t);
+    }
     if (!resp.ok) throw new Error('副API返回状态 ' + resp.status);
     const data = await resp.json();
     return (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
@@ -120,11 +154,25 @@
 
   // ============================ IndexedDB 直注 ============================
 
+  // IndexedDB 不可用时提示一次
+  function warnDbUnavailable() {
+    if (dbWarned) return;
+    dbWarned = true;
+    uiToast('当前环境不支持 IndexedDB，直注功能不可用');
+  }
+
   function openDB() {
+    if (_db) return Promise.resolve(_db);
     return new Promise((resolve, reject) => {
-      const req = indexedDB.open(DB_NAME);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+      try {
+        const req = indexedDB.open(DB_NAME);
+        req.onupgradeneeded = function () { /* 空实现，避免未初始化 store 报错 */ };
+        req.onsuccess = function () { _db = req.result; resolve(_db); };
+        req.onerror = function () { warnDbUnavailable(); reject(req.error); };
+      } catch (e) {
+        warnDbUnavailable();
+        reject(e);
+      }
     });
   }
 
@@ -388,6 +436,7 @@
       // 下载图片转 base64
       const dataUrls = [];
       const images = (data.images || []).slice(0, MAX_DIRECT_IMAGES);
+      let imgFailed = false;
       for (const img of images) {
         const imgUrl = img && (img.url || img);
         if (!imgUrl) continue;
@@ -395,7 +444,8 @@
           const dataUrl = await downloadImageAsDataUrl(imgUrl, settings.backend);
           if (dataUrl) dataUrls.push(dataUrl);
         } catch (e) {
-          // 单张失败跳过
+          // 单张失败跳过，不阻塞整体直注
+          imgFailed = true;
         }
       }
 
@@ -405,25 +455,26 @@
       const senderName = originalMsg.senderName;
       const baseTs = Date.now();
 
-      // 删除原消息
-      try { await deleteMessage(originalMsg.id); } catch (e) {}
-
-      // 添加文本消息
+      // 先添加文本消息（标记 _rlr_injected 避免轮询重复触发）
+      const textMsgId = 'msg_' + baseTs + '_t_' + Math.random().toString(36).slice(2, 8);
       await addMessage({
-        id: 'msg_' + baseTs + '_t_' + Math.random().toString(36).slice(2, 8),
+        id: textMsgId,
         text: textContent,
         isMe: true,
         type: 'text',
         timestamp: baseTs,
         conversationId: convId,
         senderId: senderId,
-        senderName: senderName
+        senderName: senderName,
+        _rlr_injected: true
       });
+      processedMessages.add(textMsgId);
 
       // 逐张添加图片消息
       for (let i = 0; i < dataUrls.length; i++) {
+        const imgId = 'msg_' + (baseTs + i + 1) + '_img_' + Math.random().toString(36).slice(2, 6);
         await addMessage({
-          id: 'msg_' + (baseTs + i + 1) + '_img_' + Math.random().toString(36).slice(2, 6),
+          id: imgId,
           text: '[Image Upload]',
           isMe: true,
           type: 'image',
@@ -432,14 +483,25 @@
           conversationId: convId,
           senderId: senderId,
           senderName: senderName,
-          isVisionRecognized: false
+          isVisionRecognized: false,
+          _rlr_injected: true
         });
+        processedMessages.add(imgId);
+      }
+
+      // 新消息全部写入成功后，最后删除原消息（避免中途失败丢消息）
+      try { await deleteMessage(originalMsg.id); } catch (e) {}
+
+      // 部分图片下载失败提示
+      if (imgFailed) {
+        uiToast('部分图片下载失败');
       }
 
       // 刷新聊天界面
       refreshChat(convId);
     } catch (e) {
       console.warn('[roche-link-reader] 直注失败', e);
+      throw e;
     }
   }
 
@@ -460,9 +522,19 @@
       const messages = await getMessagesByConversation(convId);
       if (!messages || !messages.length) return;
 
+      // processedMessages 定期清理，避免无限增长
+      if (processedMessages.size > 200) {
+        processedMessages.clear();
+      }
+
       // 找到含小红书/微博链接的 user 文本消息
       for (const msg of messages) {
         if (processedMessages.has(msg.id)) continue;
+        // 跳过本插件直注生成的消息，避免无限循环
+        if (msg._rlr_injected === true) {
+          processedMessages.add(msg.id);
+          continue;
+        }
         if (!msg.isMe) continue;
         if (msg.type !== 'text') continue;
         const text = msg.text || '';
@@ -472,8 +544,11 @@
         const link = (xhsMatch && xhsMatch[0]) || (weiboMatch && weiboMatch[0]);
         if (link) {
           processedMessages.add(msg.id);
-          // 异步处理，不阻塞轮询
-          handleDirectInjection(msg, link, convId);
+          // 异步处理，不阻塞轮询；失败则回退标记，允许下次重试
+          handleDirectInjection(msg, link, convId).catch(function () {
+            processedMessages.delete(msg.id);
+            uiToast('链接解析失败');
+          });
         }
       }
     } catch (e) {
@@ -705,12 +780,12 @@
 .rlr-root * { box-sizing: border-box; }
 .rlr-root {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
-  position: fixed; inset: 0; z-index: 9999;
+  position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 9999;
   color: #2b2b2b; font-size: 14px; line-height: 1.6;
   overflow-y: auto; padding: 24px;
 }
 .rlr-bg {
-  position: fixed; inset: 0; z-index: -1;
+  position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: -1;
   background: linear-gradient(135deg, #f6eaea 0%, #f3f0ec 45%, #eef1f4 100%);
 }
 .rlr-card {
@@ -721,7 +796,10 @@
   border-radius: 16px; padding: 24px 26px;
   box-shadow: 0 10px 40px rgba(139,58,58,0.10);
 }
-.rlr-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 6px; }
+.rlr-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.rlr-header-right { display: flex; align-items: center; gap: 12px; }
+.rlr-close-btn { min-width: 44px; min-height: 44px; padding: 0 14px; border: 1.5px solid rgba(139,58,58,.18); border-radius: 12px; background: rgba(255,255,255,.6); color: #8b3a3a; font-size: 13px; font-weight: 600; cursor: pointer; transition: all .2s ease; }
+.rlr-close-btn:hover { background: rgba(139,58,58,.12); }
 .rlr-title { font-size: 20px; font-weight: 700; color: #8b3a3a; letter-spacing: .5px; }
 .rlr-sub { font-size: 12px; color: #9a8a8a; }
 .rlr-divider { height: 1px; background: linear-gradient(90deg, rgba(139,58,58,.18), transparent); margin: 14px 0 18px; }
@@ -767,12 +845,12 @@
 .rlr-toggle .tt-text { font-size: 13px; }
 .rlr-toggle .tt-text b { color: #6a2f2f; }
 .rlr-toggle .tt-text span { display:block; font-size: 11px; color: #8a7d7d; }
-.rlr-switch { position: relative; width: 46px; height: 26px; flex: none; }
+.rlr-switch { position: relative; width: 56px; height: 32px; flex: none; }
 .rlr-switch input { display: none; }
-.rlr-slider { position: absolute; inset: 0; background: #cdb6b6; border-radius: 999px; transition: .2s ease; cursor: pointer; }
-.rlr-slider::before { content: ""; position: absolute; width: 20px; height: 20px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: .2s ease; }
+.rlr-slider { position: absolute; top: 0; right: 0; bottom: 0; left: 0; background: #cdb6b6; border-radius: 999px; transition: .2s ease; cursor: pointer; }
+.rlr-slider::before { content: ""; position: absolute; width: 26px; height: 26px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: .2s ease; }
 .rlr-switch input:checked + .rlr-slider { background: #8b3a3a; }
-.rlr-switch input:checked + .rlr-slider::before { transform: translateX(20px); }
+.rlr-switch input:checked + .rlr-slider::before { transform: translateX(24px); }
 
 .rlr-num { width: 90px; }
 .rlr-link-list { display: flex; flex-direction: column; gap: 8px; max-height: 280px; overflow-y: auto; }
@@ -784,7 +862,7 @@
 .rlr-link-item .li-title { font-size: 13px; color: #3a3434; margin-top: 3px; word-break: break-all; }
 .rlr-link-item .li-url { font-size: 11px; color: #a99; margin-top: 3px; word-break: break-all; }
 .rlr-empty { font-size: 12px; color: #9a8a8a; padding: 14px; text-align: center; }
-.rlr-modal-mask { position: fixed; inset: 0; background: rgba(40,20,20,.35); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 10000; }
+.rlr-modal-mask { position: fixed; top: 0; right: 0; bottom: 0; left: 0; background: rgba(40,20,20,.35); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 10000; }
 .rlr-modal { width: min(560px, 92vw); max-height: 80vh; overflow: auto; background: rgba(255,255,255,.9); backdrop-filter: blur(20px); border-radius: 16px; padding: 20px; box-shadow: 0 16px 50px rgba(0,0,0,.2); }
 .rlr-modal pre { white-space: pre-wrap; word-break: break-all; font-size: 12px; line-height: 1.5; color: #3a3434; }
 
@@ -802,7 +880,10 @@
   .rlr-card { padding: 16px; }
   .rlr-mode-grid { grid-template-columns: 1fr; }
   .rlr-btn { padding: 11px 16px; }
+  .rlr-btn.sm { padding: 12px 16px; }
   .rlr-input, .rlr-select { padding: 12px; font-size: 14px; }
+  .rlr-preset-chip { padding: 10px 14px; }
+  .rlr-link-item { padding: 14px; }
 }
 `;
 
@@ -1011,7 +1092,9 @@
     card.innerHTML =
       '<div class="rlr-header">' +
         '<div class="rlr-title">链接解析</div>' +
-        '<div class="rlr-sub">roche-link-reader v1.0.0</div>' +
+        '<div class="rlr-header-right"><span class="rlr-sub">roche-link-reader v1.0.0</span>' +
+          '<button class="rlr-close-btn" id="rlr-close-app" type="button" aria-label="关闭">关闭</button>' +
+        '</div>' +
       '</div>' +
       '<div class="rlr-divider"></div>' +
 
@@ -1080,12 +1163,28 @@
     container.appendChild(root);
 
     // 事件绑定
+    // 关闭面板
+    const closeBtn = root.querySelector('#rlr-close-app');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', function () {
+        try {
+          if (rocheRef && rocheRef.ui && typeof rocheRef.ui.closeApp === 'function') {
+            rocheRef.ui.closeApp();
+          }
+        } catch (e) {}
+      });
+    }
+
     // 模式选择
     root.querySelectorAll('.rlr-mode-card').forEach(c => {
       c.addEventListener('click', async () => {
         const mode = Number(c.dataset.mode);
         if (roche && roche.storage) {
           await roche.storage.set(SK.mode, mode);
+          // 切换到非模式1时，清空注入计数
+          if (mode !== 1) {
+            try { await roche.storage.set(SK.injectMeta, {}); } catch (e) {}
+          }
         }
         await refreshPanelState(root);
         showToast(root, '已切换到模式' + mode);
@@ -1203,6 +1302,8 @@
         icon: 'link',
         async mount(container, roche) {
           rocheRef = roche || rocheRef;
+          // 防重复 mount：先清理容器
+          if (container) container.innerHTML = '';
           // 插入样式（仅一次，便于清理）
           if (!injectedStyleEl) {
             injectedStyleEl = document.createElement('style');
@@ -1210,7 +1311,6 @@
             injectedStyleEl.textContent = PANEL_CSS;
             document.head.appendChild(injectedStyleEl);
           }
-          container.innerHTML = '';
           buildPanel(container, rocheRef);
         },
         async unmount(container, roche) {
@@ -1221,6 +1321,9 @@
             injectedStyleEl.parentNode.removeChild(injectedStyleEl);
             injectedStyleEl = null;
           }
+          // 停止后台轮询并清理已处理消息集合
+          stopPolling();
+          processedMessages.clear();
         }
       }
     ],
