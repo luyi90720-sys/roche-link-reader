@@ -1393,11 +1393,9 @@
       startPolling();
     },
 
-    // 插件卸载时清理
-    onUnload() {
-      stopPolling();
-      processedMessages.clear();
-    },
+    // 注意：不实现 onUnload 停止轮询的逻辑
+    // 参考 xhs-reader 设计：插件被禁用/关闭面板后，链接解析功能继续在后台运行
+    // 用户想真正停止功能时，通过 UI 上的开关控制（而非禁用插件）
 
     apps: [
       {
