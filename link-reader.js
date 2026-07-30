@@ -1385,17 +1385,11 @@
   const plugin = {
     id: PLUGIN_ID,
     name: '链接解析',
-    version: '1.0.0',
+    version: '1.0.1',
 
-    // 插件加载时启动后台轮询
-    onLoad(roche) {
-      rocheRef = roche || rocheRef;
-      startPolling();
-    },
-
-    // 注意：不实现 onUnload 停止轮询的逻辑
-    // 参考 xhs-reader 设计：插件被禁用/关闭面板后，链接解析功能继续在后台运行
-    // 用户想真正停止功能时，通过 UI 上的开关控制（而非禁用插件）
+    // 注意：不依赖 onLoad/onUnload 控制轮询生命周期
+    // 参考 xhs-reader 设计：轮询在用户首次打开 App 时启动，之后持续在后台运行
+    // 即使关闭面板或禁用插件，轮询仍继续（用户通过 UI 开关控制功能）
 
     apps: [
       {
@@ -1414,13 +1408,15 @@
             document.head.appendChild(injectedStyleEl);
           }
           buildPanel(container, rocheRef);
+          // 关键：首次 mount 时启动后台轮询（参考 xhs-reader）
+          // 后续 mount 不重复启动（startPolling 内部会先 stopPolling 再 setInterval）
+          startPolling();
         },
         async unmount(container, roche) {
           // 仅清理面板 DOM（事件监听随 DOM 一并回收）
-          // 注意：不停止后台轮询、不清空已处理消息集合
-          // 保证关闭设置面板后，链接解析功能（小红书/微博直注、contextProvider、tools）继续运行
+          // 关键：不停止后台轮询，保证关闭设置面板后链接解析功能继续运行
           if (container) container.innerHTML = '';
-          // 删除 style 标签
+          // 删除 style 标签（下次 mount 会重新插入）
           if (injectedStyleEl && injectedStyleEl.parentNode) {
             injectedStyleEl.parentNode.removeChild(injectedStyleEl);
             injectedStyleEl = null;
