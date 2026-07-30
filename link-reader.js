@@ -896,38 +896,51 @@
 .rlr-root {
   width: 100%;
   height: 100%;
+  margin: 0;
   padding: 16px;
   box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  background: #121212;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   font-size: 14px;
   color: #e0e0e0;
+  line-height: 1.5;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
 .rlr-root::-webkit-scrollbar { width: 6px; }
 .rlr-root::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 3px; }
 .rlr-card {
-  background: rgba(255,255,255,0.04);
+  background: rgba(255,255,255,0.05);
   border-radius: 12px;
   padding: 16px;
-  margin-bottom: 12px;
   border: 1px solid rgba(255,255,255,0.06);
+  flex-shrink: 0;
 }
 .rlr-card-title {
   font-size: 15px;
   font-weight: 600;
-  margin-bottom: 12px;
+  margin: 0 0 12px 0;
   color: #fff;
 }
 .rlr-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 12px;
   margin-bottom: 12px;
+  min-height: 32px;
 }
-.rlr-label { color: rgba(255,255,255,0.7); }
+.rlr-row:last-child { margin-bottom: 0; }
+.rlr-label {
+  color: rgba(255,255,255,0.7);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
 .rlr-input {
   flex: 1;
+  min-width: 0;
   padding: 8px 12px;
   background: rgba(255,255,255,0.06);
   border: 1px solid rgba(255,255,255,0.1);
@@ -939,11 +952,13 @@
 .rlr-input:focus { border-color: #C20C0C; }
 .rlr-toggle {
   width: 44px;
+  min-width: 44px;
   height: 24px;
   background: rgba(255,255,255,0.15);
   border-radius: 12px;
   position: relative;
   cursor: pointer;
+  flex-shrink: 0;
   transition: background 0.2s;
 }
 .rlr-toggle.on { background: #C20C0C; }
@@ -965,6 +980,7 @@
   border-radius: 8px;
   cursor: pointer;
   font-size: 13px;
+  flex-shrink: 0;
 }
 .rlr-btn:active { transform: scale(0.97); }
 .rlr-status {
@@ -977,7 +993,7 @@
   font-size: 12px;
   color: rgba(255,255,255,0.4);
   line-height: 1.6;
-  margin-top: 8px;
+  margin: 8px 0 0 0;
 }
 .rlr-log {
   background: rgba(0,0,0,0.3);
@@ -987,6 +1003,7 @@
   overflow-y: auto;
   font-family: monospace;
   font-size: 11px;
+  line-height: 1.5;
 }
 .rlr-log-line { margin-bottom: 2px; word-break: break-all; }
 .rlr-log-time { color: rgba(255,255,255,0.3); margin-right: 6px; }
