@@ -1,7 +1,7 @@
 {
   "id": "roche-link-reader",
   "name": "链接解析",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "解析小红书/微博/B站/知乎链接，支持图片注入和三种注入模式",
   "author": "Roche",
   "entry": "https://raw.githubusercontent.com/yechen1844/roche-link-reader/main/link-reader.js",
