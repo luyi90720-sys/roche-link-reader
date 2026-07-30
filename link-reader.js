@@ -1,7 +1,7 @@
 /**
- * Roche 链接解析插件 v2.3.4
+ * Roche 链接解析插件 v2.3.5
  *
- * 纯后台监听当前打开的聊天会话（从 viewStack 自动读取），检测到各平台链接后：
+ * 纯后台监听（通过 roche.conversation.list() 遍历所有会话 + getShortTerm 取最后1条 + 时间戳追踪），检测到各平台链接后：
  *   1. 小红书：优先走专用 HTML 抓取（__INITIAL_STATE__ 提取标题/正文/评论/图片），
  *      失败后降级走后端 /?url= 通用解析
  *   2. B站/微博/抖音/知乎/通用：走后端 /?url= 通用解析获取 JSON
@@ -625,11 +625,6 @@
     } catch (e) {}
   }
 
-  /**
-   * 获取当前用户人设（缓存），用于可靠 isMe 判断
-   * 根据官方指南：getShortTerm 返回 senderId / senderName / senderHandle，
-   * 没有 isMe 字段。需对比用户人设来判断。
-   */
   var _cachedUserPersona = null;
   async function getUserPersona() {
     if (_cachedUserPersona) return _cachedUserPersona;
@@ -642,36 +637,91 @@
     return _cachedUserPersona;
   }
 
-  /**
-   * 从 getShortTerm 消息队列中查找匹配指定文本的消息（contextProvider 回调用）
-   */
-  async function findMessageByText(convId, linkText) {
+  var _convList = null;         // 缓存的会话列表
+  var _convListTs = 0;          // 列表缓存时间
+  var _lastSeenTs = {};         // { conversationId: timestamp } 每个会话最后看到的消息时间
+
+  async function getConversationList() {
+    if (_convList && (Date.now() - _convListTs) < 30000) return _convList;
     try {
-      if (!rocheRef || !rocheRef.memory) ensureRoche();
-      if (!rocheRef || !rocheRef.memory) return null;
-      var result = await rocheRef.memory.getShortTerm({ conversationId: convId, limit: 10 });
-      var msgs = Array.isArray(result) ? result : (result && result.messages) || [];
-      // 从最新往前找，匹配包含该链接的消息
-      for (var i = msgs.length - 1; i >= 0; i--) {
-        var m = msgs[i];
-        var text = m.text || m.content || '';
-        if (text.indexOf(linkText) !== -1) return m;
+      if (!rocheRef || !rocheRef.conversation) ensureRoche();
+      if (rocheRef && rocheRef.conversation && rocheRef.conversation.list) {
+        _convList = await rocheRef.conversation.list() || [];
+        _convListTs = Date.now();
+        log('getConversationList: 获取到 ' + _convList.length + ' 个会话', 'info');
       }
     } catch (e) {
-      log('findMessageByText 失败: ' + e.message, 'warn');
+      log('getConversationList 失败: ' + e.message, 'warn');
     }
-    return null;
+    return _convList || [];
   }
 
   /**
-   * 处理 contextProvider 入队的链接
+   * 核心检测逻辑：从单个消息中检测链接并处理
+   */
+  async function processSingleMessage(m, convId, backend, cfWorker, useBuiltin) {
+    var msgText = m.text || m.content || '';
+    var links = extractLinks(msgText);
+    if (links.length === 0) return false;
+
+    var link = cleanLink(links[0]);
+    var msgId = m.id || m.messageId || (convId + '_' + m.timestamp);
+    var key = convId + '_' + msgId;
+    var now = Date.now();
+
+    await loadProcessedLinks();
+    var rec = processedLinks[key];
+    if (rec) {
+      if (rec.done) return false;
+      if (rec.processing) return false;
+      if (rec.fails > 0 && (now - (rec.lastFailTs || 0)) < FAIL_COOLDOWN) return false;
+      if (rec.fails >= MAX_FAILS) {
+        if (!rec.gaveUpLogged) { notify('链接已达最大重试次数，放弃: ' + link.substring(0, 40), 'error'); rec.gaveUpLogged = true; }
+        return false;
+      }
+    }
+
+    processedLinks[key] = { processing: true, ts: now, fails: rec ? rec.fails : 0 };
+    var platform = detectPlatform(link);
+    notify('检测到' + (PLATFORM_NAMES[platform] || '网页') + '链接，开始解析...', 'info');
+
+    try {
+      var fakeMsg = {
+        id: msgId, text: msgText, isMe: true, type: 'text',
+        timestamp: m.timestamp || Date.now(), conversationId: convId
+      };
+      if (m.senderId !== undefined) fakeMsg.senderId = m.senderId;
+      if (m.senderName !== undefined) fakeMsg.senderName = m.senderName;
+
+      var procResult = await processOneLink(fakeMsg, link, backend, cfWorker, useBuiltin);
+
+      processedLinks[key] = {
+        done: true, ts: Date.now(), injectTs: m.timestamp || Date.now(),
+        convId: convId, textMsgId: procResult.textMsgId, imageMsgIds: procResult.imageMsgIds
+      };
+      await saveProcessedLinks();
+      runtimeStats.injectedCount++;
+
+      notify('注入成功 (图片 ' + procResult.imgOk + '/' + (procResult.imgOk + procResult.imgFail) + ')', 'success');
+      await refreshRocheChat(convId);
+      return true;
+    } catch (e) {
+      notify('处理失败: ' + e.message, 'error');
+      var prevFails = (processedLinks[key] && processedLinks[key].fails) || 0;
+      processedLinks[key] = { fails: prevFails + 1, lastFailTs: Date.now(), ts: Date.now() };
+      await saveProcessedLinks();
+      return false;
+    }
+  }
+
+  /**
+   * 处理 contextProvider 入队的链接（保留作为 bonus 通道）
    */
   async function processPendingLink(item) {
     var convId = item.convId;
     var link = item.link;
     cachedConvId = convId;
 
-    // 读取设置
     var useBuiltin = true, cfWorker = null, backend = DEFAULT_BACKEND;
     try {
       if (!rocheStorage) ensureRoche();
@@ -684,23 +734,30 @@
       }
     } catch (e) {}
 
-    // 去重：检查是否已处理
     await loadProcessedLinks();
     var dedupKey = convId + '_link_' + link;
-    if (processedLinks[dedupKey] && processedLinks[dedupKey].done) return;
-    if (processedLinks[dedupKey] && processedLinks[dedupKey].processing) return;
+    if (processedLinks[dedupKey] && (processedLinks[dedupKey].done || processedLinks[dedupKey].processing)) return;
 
     processedLinks[dedupKey] = { processing: true, ts: Date.now() };
 
-    // 从 getShortTerm 查找真实消息对象（获取 id / timestamp）
-    var m = await findMessageByText(convId, link);
+    // 从 getShortTerm 查找对应消息
+    var m = null;
+    try {
+      if (rocheRef && rocheRef.memory) {
+        var result = await rocheRef.memory.getShortTerm({ conversationId: convId, limit: 10 });
+        var msgs = Array.isArray(result) ? result : (result && result.messages) || [];
+        for (var i = msgs.length - 1; i >= 0; i--) {
+          if ((msgs[i].text || msgs[i].content || '').indexOf(link) !== -1) { m = msgs[i]; break; }
+        }
+      }
+    } catch (e) {}
+
     var msgId, msgText, msgTs;
     if (m) {
       msgId = m.id || m.messageId || (convId + '_' + m.timestamp);
       msgText = m.text || m.content || item.rawText;
       msgTs = m.timestamp || Date.now();
     } else {
-      // 备用：用 contextProvider 的信息构造
       msgId = convId + '_ctx_' + Date.now();
       msgText = item.rawText;
       msgTs = Date.now();
@@ -710,21 +767,14 @@
     notify('检测到' + (PLATFORM_NAMES[platform] || '网页') + '链接，开始解析...', 'info');
 
     try {
-      var fakeMsg = {
-        id: msgId, text: msgText, isMe: true, type: 'text',
-        timestamp: msgTs, conversationId: convId
-      };
+      var fakeMsg = { id: msgId, text: msgText, isMe: true, type: 'text', timestamp: msgTs, conversationId: convId };
       if (m && m.senderId !== undefined) fakeMsg.senderId = m.senderId;
       if (m && m.senderName !== undefined) fakeMsg.senderName = m.senderName;
 
       var procResult = await processOneLink(fakeMsg, link, backend, cfWorker, useBuiltin);
 
-      processedLinks[dedupKey] = {
-        done: true, ts: Date.now(), injectTs: msgTs,
-        convId: convId, textMsgId: procResult.textMsgId, imageMsgIds: procResult.imageMsgIds
-      };
+      processedLinks[dedupKey] = { done: true, ts: Date.now(), injectTs: msgTs, convId: convId, textMsgId: procResult.textMsgId, imageMsgIds: procResult.imageMsgIds };
       await saveProcessedLinks();
-
       notify('注入成功 (图片 ' + procResult.imgOk + '/' + (procResult.imgOk + procResult.imgFail) + ')', 'success');
       await refreshRocheChat(convId);
     } catch (e) {
@@ -733,10 +783,6 @@
     }
   }
 
-  /**
-   * contextProvider 触发的异步处理调度器
-   * 不依赖 mount()/pollTimer，在 contextProvider 检测到链接后直接 setTimeout 处理
-   */
   var _processScheduled = false;
   function scheduleProcessContext() {
     if (_processScheduled) return;
@@ -744,19 +790,11 @@
     setTimeout(async function() {
       try {
         ensureRoche();
-        runtimeStats.queueSize = pendingLinks.length;
         while (pendingLinks.length > 0) {
           var item = pendingLinks.shift();
-          try {
-            await processPendingLink(item);
-            runtimeStats.injectedCount++;
-          } catch (e) {
-            log('scheduleProcessContext: 处理失败 (' + e.message + ')', 'error');
-          }
+          try { await processPendingLink(item); runtimeStats.injectedCount++; } catch (e) {}
         }
-      } finally {
-        _processScheduled = false;
-      }
+      } finally { _processScheduled = false; }
     }, 300);
   }
 
@@ -765,7 +803,7 @@
     isPolling = true;
     runtimeStats.pollActive = true;
     try {
-      // 优先处理 contextProvider 入队的链接（最可靠的检测来源）
+      // 优先处理 contextProvider 入队的链接
       runtimeStats.queueSize = pendingLinks.length;
       while (pendingLinks.length > 0) {
         var item = pendingLinks.shift();
@@ -773,20 +811,14 @@
           await processPendingLink(item);
           runtimeStats.injectedCount++;
         } catch (e) {
-          log('processPendingLink 异常: ' + e.message, 'error');
+          log('pendingLink 处理异常: ' + e.message, 'error');
         }
       }
 
-      // 兜底：getShortTerm 轮询（contextProvider 可能未触发的情况）
-      var convId = cachedConvId || getCurrentConversationId();
-      runtimeStats.lastPollConvId = convId;
-      if (!convId) {
-        runtimeStats.lastPollTime = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-        return;
-      }
-
+      // 读取设置
       var useBuiltin = true, cfWorker = null, backend = DEFAULT_BACKEND;
       try {
+        if (!rocheStorage) ensureRoche();
         if (rocheStorage) {
           var v2 = await rocheStorage.get(SK.useBuiltinProxy);
           if (v2 !== null && v2 !== undefined) useBuiltin = v2 !== false && v2 !== '0' && v2 !== 0;
@@ -796,88 +828,65 @@
         }
       } catch (e) {}
 
-      var msgs = [];
-      try {
-        var result = await rocheRef.memory.getShortTerm({ conversationId: convId, limit: 3 });
-        msgs = Array.isArray(result) ? result : (result && result.messages) || [];
-      } catch (e) {
-        log('pollOnce: getShortTerm 失败 (' + e.message + '), 跳过本轮', 'warn');
-        runtimeStats.lastPollTime = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-        runtimeStats.lastPollMsgCount = -1; // -1 = error
-        return;
-      }
-      runtimeStats.lastPollMsgCount = msgs.length;
-      runtimeStats.lastPollTime = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-      if (msgs.length === 0) return;
-
-      var m = msgs[msgs.length - 1];
-
-      // 正确判断是否用户消息：对比用户人设的 id/name/handle
-      var isMe = false;
+      // 获取用户人设（缓存，用于 isMe 判断）
       var user = await getUserPersona();
-      if (user) {
-        isMe = (m.senderId && (m.senderId === user.id || m.senderId === user.handle)) ||
-               (m.senderHandle && m.senderHandle === user.handle) ||
-               (m.senderName && m.senderName === user.name);
-      }
-      if (!isMe && m.type !== 'assistant' && !m.senderId && !m.senderName) {
-        isMe = true;
-      }
-      runtimeStats.lastPollIsMe = isMe;
-      if (!isMe) return;
-      if (m.type && m.type !== 'text') return;
 
-      var msgText = m.text || m.content || '';
-      var links = extractLinks(msgText);
-      runtimeStats.lastPollHasLink = links.length > 0;
-      runtimeStats.lastPollLink = links.length > 0 ? cleanLink(links[0]).substring(0, 60) : null;
-      if (links.length === 0) return;
+      // 遍历所有会话，只取每条会话最新 1 条消息，追踪时间戳变化
+      var conversations = await getConversationList();
+      runtimeStats.lastPollMsgCount = conversations.length;
+      runtimeStats.lastPollTime = new Date().toLocaleTimeString('zh-CN', { hour12: false });
 
-      var link = cleanLink(links[0]);
-      var msgId = m.id || m.messageId || (convId + '_' + m.timestamp);
-      var key = convId + '_' + msgId;
-      var now = Date.now();
+      for (var i = 0; i < conversations.length; i++) {
+        var c = conversations[i];
+        var convId = c.id || c.conversationId;
+        if (!convId) continue;
 
-      await loadProcessedLinks();
-      var rec = processedLinks[key];
-      if (rec) {
-        if (rec.done) return;
-        if (rec.processing) return;
-        if (rec.fails > 0 && (now - (rec.lastFailTs || 0)) < FAIL_COOLDOWN) return;
-        if (rec.fails >= MAX_FAILS) {
-          if (!rec.gaveUpLogged) { notify('链接已达最大重试次数(' + MAX_FAILS + ')，放弃: ' + link.substring(0, 40) + '...', 'error'); rec.gaveUpLogged = true; }
-          return;
+        // 记录会话 ID 来源信息
+        if (i === 0) {
+          cachedConvId = convId;
+          runtimeStats.lastPollConvId = convId;
+          runtimeStats.convIdSource = 'conversation.list';
         }
-      }
 
-      processedLinks[key] = { processing: true, ts: now, fails: rec ? rec.fails : 0 };
-      var platform = detectPlatform(link);
-      notify('检测到' + (PLATFORM_NAMES[platform] || '网页') + '链接，开始解析...', 'info');
+        // 取该会话最新 1 条消息
+        var msgs = [];
+        try {
+          var result = await rocheRef.memory.getShortTerm({ conversationId: convId, limit: 1 });
+          msgs = Array.isArray(result) ? result : (result && result.messages) || [];
+        } catch (e) { continue; }
+        if (msgs.length === 0) continue;
 
-      try {
-        var fakeMsg = {
-          id: msgId, text: msgText, isMe: true, type: 'text',
-          timestamp: m.timestamp || Date.now(), conversationId: convId
-        };
-        if (m.senderId !== undefined) fakeMsg.senderId = m.senderId;
-        if (m.senderName !== undefined) fakeMsg.senderName = m.senderName;
+        var m = msgs[0];
+        var ts = m.timestamp || 0;
 
-        var procResult = await processOneLink(fakeMsg, link, backend, cfWorker, useBuiltin);
+        // 跳过已见过的消息
+        if (ts <= (_lastSeenTs[convId] || 0)) continue;
+        _lastSeenTs[convId] = ts;
 
-        processedLinks[key] = {
-          done: true, ts: Date.now(), injectTs: m.timestamp || Date.now(),
-          convId: convId, textMsgId: procResult.textMsgId, imageMsgIds: procResult.imageMsgIds
-        };
-        await saveProcessedLinks();
-        runtimeStats.injectedCount++;
+        // 判断是否用户消息
+        var isMe = false;
+        if (user) {
+          isMe = (m.senderId && (m.senderId === user.id || m.senderId === user.handle)) ||
+                 (m.senderHandle && m.senderHandle === user.handle) ||
+                 (m.senderName && m.senderName === user.name);
+        }
+        if (!isMe && m.type !== 'assistant' && !m.senderId && !m.senderName) {
+          isMe = true;
+        }
+        if (!isMe) continue;
+        if (m.type && m.type !== 'text') continue;
 
-        notify('注入成功 (图片 ' + procResult.imgOk + '/' + (procResult.imgOk + procResult.imgFail) + ')', 'success');
-        await refreshRocheChat(convId);
-      } catch (e) {
-        notify('处理失败: ' + e.message, 'error');
-        var prevFails = (processedLinks[key] && processedLinks[key].fails) || 0;
-        processedLinks[key] = { fails: prevFails + 1, lastFailTs: Date.now(), ts: Date.now() };
-        await saveProcessedLinks();
+        runtimeStats.lastPollIsMe = true;
+        runtimeStats.lastPollHasLink = false;
+        runtimeStats.lastPollLink = null;
+
+        var msgText = m.text || m.content || '';
+        var links = extractLinks(msgText);
+        if (links.length > 0) {
+          runtimeStats.lastPollHasLink = true;
+          runtimeStats.lastPollLink = cleanLink(links[0]).substring(0, 60);
+          await processSingleMessage(m, convId, backend, cfWorker, useBuiltin);
+        }
       }
     } finally {
       isPolling = false;
@@ -887,8 +896,10 @@
 
   function startPolling() {
     if (pollTimer) return;
-    log('启动后台监听');
+    log('启动后台监听（conversation.list 遍历模式）');
     runtimeStats.pollActive = true;
+    // 启动时清空 lastSeenTs，避免跳过已有消息
+    _lastSeenTs = {};
     pollTimer = setInterval(pollOnce, POLL_INTERVAL);
   }
 
@@ -1300,7 +1311,7 @@
   window.RochePlugin.register({
     id: PLUGIN_ID,
     name: '链接解析',
-    version: '2.3.4',
+    version: '2.3.5',
     apps: [{
       id: APP_ID,
       name: '链接解析',
