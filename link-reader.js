@@ -1,5 +1,5 @@
 /**
- * Roche 链接解析插件 v2.3.1
+ * Roche 链接解析插件 v2.3.3
  *
  * 纯后台监听当前打开的聊天会话（从 viewStack 自动读取），检测到各平台链接后：
  *   1. 小红书：优先走专用 HTML 抓取（__INITIAL_STATE__ 提取标题/正文/评论/图片），
@@ -77,6 +77,21 @@
   var processedLinksLoaded = false;
   var pendingLinks = [];       // contextProvider 检测到的待处理链接
   var cachedConvId = null;     // contextProvider 缓存的当前会话 ID
+
+  // 运行时统计（用于实时状态面板诊断）
+  var runtimeStats = {
+    pollActive: false,
+    ctxProviderCalls: 0,
+    lastPollTime: null,
+    lastPollConvId: null,
+    lastPollMsgCount: 0,
+    lastPollIsMe: null,
+    lastPollHasLink: false,
+    lastPollLink: null,
+    queueSize: 0,
+    injectedCount: 0,
+    convIdSource: null     // 'ctxProvider' | 'viewStack' | null
+  };
 
   // ============================ 日志 ============================
   var logs = [];
@@ -426,13 +441,26 @@
   }
 
   function getCurrentConversationId() {
+    // 方案 A: Pinia viewStack
     var navStore = getViewStackStore();
     if (navStore && navStore.viewStack && navStore.viewStack.length > 0) {
       var top = navStore.viewStack[navStore.viewStack.length - 1];
       if (top && top.name === 'chat' && top.params && top.params.id) {
+        runtimeStats.convIdSource = 'viewStack';
         return top.params.id;
       }
     }
+    // 方案 B: 遍历 viewStack 中任意带 params.id 的项
+    if (navStore && navStore.viewStack && navStore.viewStack.length > 0) {
+      for (var vi = navStore.viewStack.length - 1; vi >= 0; vi--) {
+        var item = navStore.viewStack[vi];
+        if (item && item.params && item.params.id) {
+          runtimeStats.convIdSource = 'viewStack(v2)';
+          return item.params.id;
+        }
+      }
+    }
+    runtimeStats.convIdSource = null;
     return null;
   }
 
@@ -689,12 +717,15 @@
   async function pollOnce() {
     if (isPolling) return;
     isPolling = true;
+    runtimeStats.pollActive = true;
     try {
       // 优先处理 contextProvider 入队的链接（最可靠的检测来源）
+      runtimeStats.queueSize = pendingLinks.length;
       while (pendingLinks.length > 0) {
         var item = pendingLinks.shift();
         try {
           await processPendingLink(item);
+          runtimeStats.injectedCount++;
         } catch (e) {
           log('processPendingLink 异常: ' + e.message, 'error');
         }
@@ -702,7 +733,11 @@
 
       // 兜底：getShortTerm 轮询（contextProvider 可能未触发的情况）
       var convId = cachedConvId || getCurrentConversationId();
-      if (!convId) return;
+      runtimeStats.lastPollConvId = convId;
+      if (!convId) {
+        runtimeStats.lastPollTime = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+        return;
+      }
 
       var useBuiltin = true, cfWorker = null, backend = DEFAULT_BACKEND;
       try {
@@ -721,14 +756,17 @@
         msgs = Array.isArray(result) ? result : (result && result.messages) || [];
       } catch (e) {
         log('pollOnce: getShortTerm 失败 (' + e.message + '), 跳过本轮', 'warn');
+        runtimeStats.lastPollTime = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+        runtimeStats.lastPollMsgCount = -1; // -1 = error
         return;
       }
+      runtimeStats.lastPollMsgCount = msgs.length;
+      runtimeStats.lastPollTime = new Date().toLocaleTimeString('zh-CN', { hour12: false });
       if (msgs.length === 0) return;
 
       var m = msgs[msgs.length - 1];
 
       // 正确判断是否用户消息：对比用户人设的 id/name/handle
-      // getShortTerm 不返回 isMe/role，只有 senderId/senderName/senderHandle
       var isMe = false;
       var user = await getUserPersona();
       if (user) {
@@ -736,15 +774,17 @@
                (m.senderHandle && m.senderHandle === user.handle) ||
                (m.senderName && m.senderName === user.name);
       }
-      // 兜底：type 不为 'assistant' 且 senderName 为空（用户消息通常没有 senderName）
       if (!isMe && m.type !== 'assistant' && !m.senderId && !m.senderName) {
         isMe = true;
       }
+      runtimeStats.lastPollIsMe = isMe;
       if (!isMe) return;
       if (m.type && m.type !== 'text') return;
 
       var msgText = m.text || m.content || '';
       var links = extractLinks(msgText);
+      runtimeStats.lastPollHasLink = links.length > 0;
+      runtimeStats.lastPollLink = links.length > 0 ? cleanLink(links[0]).substring(0, 60) : null;
       if (links.length === 0) return;
 
       var link = cleanLink(links[0]);
@@ -783,6 +823,7 @@
           convId: convId, textMsgId: procResult.textMsgId, imageMsgIds: procResult.imageMsgIds
         };
         await saveProcessedLinks();
+        runtimeStats.injectedCount++;
 
         notify('注入成功 (图片 ' + procResult.imgOk + '/' + (procResult.imgOk + procResult.imgFail) + ')', 'success');
         await refreshRocheChat(convId);
@@ -794,17 +835,20 @@
       }
     } finally {
       isPolling = false;
+      runtimeStats.pollActive = false;
     }
   }
 
   function startPolling() {
     if (pollTimer) return;
     log('启动后台监听');
+    runtimeStats.pollActive = true;
     pollTimer = setInterval(pollOnce, POLL_INTERVAL);
   }
 
   function stopPolling() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; log('停止后台监听'); }
+    runtimeStats.pollActive = false;
   }
 
   // ============================ 设置读写 ============================
@@ -916,6 +960,27 @@
 '  padding:3px 10px; border-radius:12px; font-size:12px;',
 '  background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.5);',
 '}',
+'.rlr-status-card {',
+'  background:rgba(0,0,0,0.25); border-radius:12px; padding:14px 16px;',
+'  border:1px solid rgba(255,255,255,0.08); flex-shrink:0;',
+'}',
+'.rlr-status-row {',
+'  display:flex; align-items:center; justify-content:space-between;',
+'  font-size:12px; margin-bottom:6px;',
+'}',
+'.rlr-status-row:last-child { margin-bottom:0; }',
+'.rlr-status-dot {',
+'  width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:6px;',
+'}',
+'.rlr-status-dot.green { background:#4ade80; }',
+'.rlr-status-dot.yellow { background:#fbbf24; }',
+'.rlr-status-dot.red { background:#f87171; }',
+'.rlr-status-dot.gray { background:rgba(255,255,255,0.3); }',
+'.rlr-status-label { color:rgba(255,255,255,0.45); }',
+'.rlr-status-value { color:rgba(255,255,255,0.8); font-family:monospace; font-size:11px; max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }',
+'.rlr-status-value.good { color:#4ade80; }',
+'.rlr-status-value.warn { color:#fbbf24; }',
+'.rlr-status-value.bad { color:#f87171; }',
     ].join('\n');
   }
 
@@ -930,6 +995,57 @@
       return '<div class="rlr-log-line"><span class="rlr-log-time">' + l.time + '</span><span class="rlr-log-' + l.type + '">' + l.msg + '</span></div>';
     }).join('');
     el.scrollTop = el.scrollHeight;
+  }
+
+  var statusTimer = null;
+
+  function renderStatus() {
+    if (!rootEl) return;
+    var card = rootEl.querySelector('#rlr-status-card');
+    if (!card) return;
+
+    var st = runtimeStats;
+    var pollOk = pollTimer !== null;
+    var dotClass = pollOk ? 'green' : (st.ctxProviderCalls > 0 ? 'yellow' : 'red');
+    var hasConvId = !!(st.lastPollConvId);
+    var convIdShort = st.lastPollConvId ? String(st.lastPollConvId).substring(0, 16) + '...' : '无';
+
+    card.innerHTML = [
+      '<div class="rlr-status-row">',
+      '  <span><span class="rlr-status-dot ' + dotClass + '"></span><span class="rlr-status-label">监听状态</span></span>',
+      '  <span class="rlr-status-value ' + (pollOk ? 'good' : 'bad') + '">' + (pollOk ? '运行中' : '未启动') + '</span>',
+      '</div>',
+      '<div class="rlr-status-row">',
+      '  <span class="rlr-status-label">会话ID来源</span>',
+      '  <span class="rlr-status-value ' + (hasConvId ? 'good' : 'warn') + '">' + (st.convIdSource || '无') + ' | ' + convIdShort + '</span>',
+      '</div>',
+      '<div class="rlr-status-row">',
+      '  <span class="rlr-status-label">ctxProvider 触发</span>',
+      '  <span class="rlr-status-value ' + (st.ctxProviderCalls > 0 ? 'good' : 'warn') + '">' + st.ctxProviderCalls + ' 次</span>',
+      '</div>',
+      '<div class="rlr-status-row">',
+      '  <span class="rlr-status-label">队列 / 已注入</span>',
+      '  <span class="rlr-status-value">' + st.queueSize + ' / ' + st.injectedCount + '</span>',
+      '</div>',
+      '<div class="rlr-status-row">',
+      '  <span class="rlr-status-label">上次轮询</span>',
+      '  <span class="rlr-status-value">' + (st.lastPollTime || '未轮询') + '</span>',
+      '</div>',
+      '<div class="rlr-status-row">',
+      '  <span class="rlr-status-label">消息数 / 是用户 / 含链接</span>',
+      '  <span class="rlr-status-value">' + st.lastPollMsgCount + ' / ' + (st.lastPollIsMe === null ? '-' : (st.lastPollIsMe ? '是' : '否')) + ' / ' + (st.lastPollHasLink ? '是' : '否') + '</span>',
+      '</div>',
+      st.lastPollLink ? '<div class="rlr-status-row"><span class="rlr-status-label">上次检测链接</span><span class="rlr-status-value">' + st.lastPollLink + '</span></div>' : '',
+    ].join('');
+  }
+
+  function startStatusTimer() {
+    if (statusTimer) return;
+    statusTimer = setInterval(renderStatus, 1500);
+  }
+
+  function stopStatusTimer() {
+    if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
   }
 
   async function initApp(container, roche) {
@@ -956,6 +1072,9 @@
       '<div class="rlr-topbar">',
       '  <span class="rlr-title">链接解析</span>',
       '  <button class="rlr-close-btn" id="rlr-close-btn" title="关闭">\u2715</button>',
+      '</div>',
+      '<div class="rlr-status-card" id="rlr-status-card">',
+      '  <div style="color:rgba(255,255,255,0.3);font-size:12px;">加载中...</div>',
       '</div>',
       '<div class="rlr-card">',
       '  <div class="rlr-card-title">设置</div>',
@@ -988,6 +1107,7 @@
       '  <div style="display:flex;gap:8px;">',
       '    <button class="rlr-btn rlr-btn-sm" id="rlr-test-btn">测试解析</button>',
       '    <button class="rlr-btn rlr-btn-sm rlr-btn-outline" id="rlr-clear-test-btn">清空</button>',
+      '    <button class="rlr-btn rlr-btn-sm rlr-btn-outline" id="rlr-scan-btn">手动扫描会话</button>',
       '  </div>',
       '  <div class="rlr-test-result" id="rlr-test-result" style="display:none;"></div>',
       '</div>',
@@ -1097,6 +1217,33 @@
       testResultEl.textContent = '';
     });
 
+    // 手动扫描当前会话
+    var scanBtn = rootEl.querySelector('#rlr-scan-btn');
+    scanBtn.addEventListener('click', async function() {
+      scanBtn.disabled = true;
+      scanBtn.textContent = '扫描中...';
+      try {
+        var testConvId = cachedConvId || getCurrentConversationId();
+        if (!testConvId) {
+          uiToast('无法获取当前会话ID（viewStack: ' + (getViewStackStore() ? '有' : '无') + ', cached: ' + (cachedConvId || '无') + '）');
+          log('手动扫描: 无法获取 convId', 'warn');
+          return;
+        }
+        log('手动扫描: convId=' + testConvId + ', 来源=' + runtimeStats.convIdSource);
+        // 强制触发一轮 pollOnce
+        isPolling = false;
+        await pollOnce();
+        uiToast('扫描完成');
+      } catch (e) {
+        uiToast('扫描出错: ' + e.message);
+      } finally {
+        scanBtn.disabled = false;
+        scanBtn.textContent = '手动扫描会话';
+      }
+    });
+
+    renderStatus();
+    startStatusTimer();
     if (settings.enabled) startPolling();
   }
 
@@ -1107,7 +1254,7 @@
   window.RochePlugin.register({
     id: PLUGIN_ID,
     name: '链接解析',
-    version: '2.3.2',
+    version: '2.3.3',
     apps: [{
       id: APP_ID,
       name: '链接解析',
@@ -1120,6 +1267,7 @@
       },
       async unmount(container, roche) {
         rootEl = null;
+        stopStatusTimer();
         container.replaceChildren();
       }
     }],
@@ -1127,6 +1275,7 @@
       // contextProvider：由 Roche 每轮聊天自动调用，可靠获取 conversationId + 最新用户消息
       // 不注入任何上下文到 system prompt，仅用于链接检测
       contextProvider: function(ctx) {
+        runtimeStats.ctxProviderCalls++;
         if (!ctx || !ctx.latestUserMessage || !ctx.conversationId) return null;
         var links = extractLinks(ctx.latestUserMessage);
         if (links.length === 0) return null;
@@ -1135,6 +1284,7 @@
 
         // 缓存当前会话 ID（供 pollOnce 兜底使用）
         cachedConvId = ctx.conversationId;
+        runtimeStats.convIdSource = 'ctxProvider';
 
         // 检查是否已处理过
         var dedupKey = ctx.conversationId + '_link_' + link;
