@@ -1,8 +1,8 @@
 {
   "id": "roche-link-reader",
   "name": "链接解析",
-  "version": "2.2.0",
-  "description": "纯后台监听当前会话，检测小红书链接自动解析并直注文本+图片，DB短连接，三级代理降级，无需工具调用",
+  "version": "2.3.0",
+  "description": "多平台链接解析：小红书(含评论) | B站(含字幕) | 微博 | 抖音 | 知乎 | 通用网页。纯后台监听当前会话，DB短连接，三级代理降级，支持测试链接",
   "author": "Roche",
   "entry": "https://raw.githubusercontent.com/yechen1844/roche-link-reader/main/link-reader.js",
   "hash": "",
