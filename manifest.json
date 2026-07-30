@@ -1,10 +1,10 @@
 {
   "id": "roche-link-reader",
   "name": "链接解析",
-  "version": "2.1.0",
-  "description": "纯后台监听当前会话，检测链接自动解析并直注文本+图片，DB短连接模式，无需工具调用",
+  "version": "2.2.0",
+  "description": "纯后台监听当前会话，检测小红书链接自动解析并直注文本+图片，DB短连接，三级代理降级，无需工具调用",
   "author": "Roche",
   "entry": "https://raw.githubusercontent.com/yechen1844/roche-link-reader/main/link-reader.js",
   "hash": "",
-  "permissions": ["memory:read", "storage", "ui"]
+  "permissions": ["memory:read", "persona:read", "storage", "ui"]
 }
