@@ -1,5 +1,5 @@
 /**
- * Roche 链接解析插件 v2.3.0
+ * Roche 链接解析插件 v2.3.1
  *
  * 纯后台监听当前打开的聊天会话（从 viewStack 自动读取），检测到各平台链接后：
  *   1. 小红书：优先走专用 HTML 抓取（__INITIAL_STATE__ 提取标题/正文/评论/图片），
@@ -323,167 +323,57 @@
     if (data.title) { lines.push('# ' + data.title); lines.push(''); }
     var body = data.desc || data.content || data.text || data.body || '';
     if (body) { lines.push(body); lines.push(''); }
-    if (data.author) lines.push('作者：' + data.author);
-    if (data.tags && data.tags.length > 0) lines.push('标签：' + data.tags.join(' '));
-    // B站字幕
-    if (data.subtitles || data.subtitle) {
-      lines.push('');
-      lines.push('【字幕内容】');
-      lines.push(data.subtitles || data.subtitle);
+
+    // 作者（可能是对象 {name,nickname} 或字符串）
+    var authorName = '';
+    if (typeof data.author === 'object' && data.author) {
+      authorName = data.author.name || data.author.nickname || '';
+    } else if (typeof data.author === 'string') {
+      authorName = data.author;
     }
+    if (authorName) lines.push('作者：' + authorName);
+
+    if (data.tags && data.tags.length > 0) lines.push('标签：' + data.tags.join(' '));
+
+    // 评论（小红书等平台，后端用 iPhone UA 抓取含评论的 HTML）
+    if (data.comments && data.comments.length > 0) {
+      lines.push('');
+      lines.push('【热门评论】');
+      for (var ci = 0; ci < data.comments.length && ci < 10; ci++) {
+        var c = data.comments[ci];
+        var uname = c.nickname || c.author || '匿名';
+        var cline = '- ' + uname + '：' + (c.content || '');
+        if (c.likedCount > 0) cline += ' (' + c.likedCount + '赞)';
+        lines.push(cline);
+      }
+    }
+
+    // B站字幕（data.subtitle 是对象 {available, text, srt} 或字符串）
+    if (data.subtitles || data.subtitle) {
+      var subSrc = data.subtitle || data.subtitles;
+      var subText = '';
+      if (typeof subSrc === 'object' && subSrc) {
+        subText = subSrc.text || subSrc.srt || '';
+      } else if (typeof subSrc === 'string') {
+        subText = subSrc;
+      }
+      if (subText) {
+        lines.push('');
+        lines.push('【字幕内容】');
+        lines.push(subText);
+      }
+    }
+
     if (data.video) lines.push('（含视频内容）');
-    if (data.likeCount !== undefined) lines.push('点赞：' + data.likeCount);
+    if (data.likedCount !== undefined) lines.push('点赞：' + data.likedCount);
+    else if (data.likeCount !== undefined) lines.push('点赞：' + data.likeCount);
     if (data.commentCount !== undefined) lines.push('评论数：' + data.commentCount);
     lines.push('');
     lines.push('原始链接：' + link);
     return lines.join('\n');
   }
 
-  // ============================ 小红书专用：HTML 抓取 + __INITIAL_STATE__ 解析 ============================
-
-  function extractXhsUrl(text) {
-    if (!text) return null;
-    var m = text.match(/https?:\/\/(?:xhslink\.(?:com|cn)\/[^\s`'"（()）,。！？；、）)\]》\u4e00-\u9fa5]+|www\.xiaohongshu\.com\/[^\s`'"（()）,。！？；、）)\]》\u4e00-\u9fa5]+)/);
-    return m ? m[0].replace(/[,。！？；，、]+$/, '').trim() : null;
-  }
-
-  async function fetchXhsHtml(xhsUrl, cfWorker, useBuiltin) {
-    var proxies = getProxies(cfWorker, useBuiltin);
-    if (proxies.length === 0) throw new Error('未配置代理');
-
-    var errors = [];
-    for (var i = 0; i < proxies.length; i++) {
-      var pn = proxies[i].name;
-      var pu = proxies[i].fn(xhsUrl);
-      try {
-        var result = await smartFetch(pu, {}, 15000);
-        if (!result.ok) { errors.push(pn + ': ' + result.error); continue; }
-        if (!result.resp.ok) { errors.push(pn + ': HTTP ' + result.resp.status); continue; }
-        var html = await result.resp.text();
-        if (html && html.includes('__INITIAL_STATE__') && html.includes('commentData')) {
-          return html;
-        }
-        errors.push(pn + ': 无评论数据');
-      } catch (e) {
-        errors.push(pn + ': ' + (e.message || e.name));
-      }
-      if (i < proxies.length - 1) await new Promise(function(r) { setTimeout(r, 500); });
-    }
-    throw new Error('fetchXhsHtml 失败: ' + errors.join(' | '));
-  }
-
-  function parseXhsState(html) {
-    var m = html.match(/window\.__INITIAL_STATE__\s*=\s*(\{[\s\S]+?\})\s*<\/script>/);
-    if (!m) throw new Error('未找到 __INITIAL_STATE__');
-    return JSON.parse(m[1].replace(/undefined/g, 'null'));
-  }
-
-  function extractXhsNote(state) {
-    return (state && state.noteData && state.noteData.data && state.noteData.data.noteData) || null;
-  }
-
-  function extractXhsComments(state) {
-    return (state && state.noteData && state.noteData.data && state.noteData.data.commentData) || null;
-  }
-
-  function normalizeImgUrl(url) {
-    if (!url) return '';
-    if (url.startsWith('//')) return 'https:' + url;
-    if (!url.startsWith('http')) return '';
-    return url;
-  }
-
-  function extractXhsImages(note) {
-    var imgs = [];
-    if (note.type === 'video') {
-      var cover = (note.video && (note.video.imageUrl || (note.video.coverImage && note.video.coverImage.url))) || '';
-      var url = normalizeImgUrl(cover);
-      if (url) imgs.push({ url: url, alt: '视频封面' });
-    }
-    if (note.imageList && note.imageList.length) {
-      for (var i = 0; i < note.imageList.length && i < MAX_IMAGES; i++) {
-        var u = normalizeImgUrl(note.imageList[i].url || note.imageList[i].urlDefault || '');
-        if (u) imgs.push({ url: u, alt: '笔记配图' });
-      }
-    }
-    return imgs;
-  }
-
-  function extractXhsTags(note) {
-    var tags = [];
-    if (note.tagList && note.tagList.length) {
-      for (var i = 0; i < note.tagList.length; i++) {
-        var t = note.tagList[i];
-        var name = typeof t === 'string' ? t : (t.name || t.id || '');
-        if (name) tags.push(name);
-      }
-    }
-    return tags;
-  }
-
-  function formatXhsComments(comments) {
-    if (!comments || !comments.comments || !comments.comments.length) return '';
-    var lines = ['热门评论：'];
-    for (var i = 0; i < comments.comments.length && i < 10; i++) {
-      var c = comments.comments[i];
-      var u = (c.user && (c.user.nickName || c.user.nickname)) || '匿名';
-      var txt = (c.content || '').trim();
-      var line = '- ' + u + '：' + txt;
-      if (c.likeCount > 0) line += ' (' + c.likeCount + '赞)';
-      lines.push(line);
-      if (c.subComments && c.subComments.length) {
-        for (var j = 0; j < c.subComments.length && j < 2; j++) {
-          var sc = c.subComments[j];
-          var su = (sc.user && (sc.user.nickName || sc.user.nickname)) || '匿名';
-          lines.push('  \u21B3 ' + su + '：' + (sc.content || ''));
-        }
-      }
-    }
-    return lines.join('\n');
-  }
-
-  function formatXhsText(note, comments, sharerName) {
-    var lines = [];
-    lines.push(sharerName + '分享了一个小红书笔记：');
-    lines.push('');
-    lines.push('# ' + (note.title || '(无标题)'));
-    lines.push('');
-    lines.push(note.desc || '(无正文)');
-    lines.push('');
-    var tags = extractXhsTags(note);
-    if (tags.length > 0) {
-      lines.push('标签：' + tags.join(' '));
-      lines.push('');
-    }
-    var commentText = formatXhsComments(comments);
-    if (commentText) {
-      lines.push(commentText);
-    }
-    return lines.join('\n');
-  }
-
-  async function processXhsLink(xhsUrl, cfWorker, useBuiltin) {
-    var html = await fetchXhsHtml(xhsUrl, cfWorker, useBuiltin);
-    var state = parseXhsState(html);
-    var note = extractXhsNote(state);
-    if (!note) throw new Error('未找到笔记数据');
-    var comments = extractXhsComments(state);
-    return { note: note, comments: comments, images: extractXhsImages(note), isXhs: true };
-  }
-
-  // ============================ 用户人设 ============================
-
-  async function getSharerName() {
-    try {
-      if (rocheRef && rocheRef.persona && rocheRef.persona.getActiveUserPersona) {
-        var p = await rocheRef.persona.getActiveUserPersona();
-        return (p && (p.handle || p.name)) || '我';
-      }
-    } catch (e) {}
-    return '我';
-  }
-
-  // ============================ Pinia / viewStack ============================
+  // ============================ 消息注入 ============================
 
   function getPinia() {
     try {
@@ -646,60 +536,30 @@
    *   其他平台 → 走后端 /?url= 通用解析
    *   下载图片 → 删除原消息 → 注入文本 + 图片
    */
+  /**
+   * 统一走后端 /?url= 解析（后端已用 iPhone UA 抓 XHS，含评论）
+   */
   async function processOneLink(msg, link, backend, cfWorker, useBuiltin) {
     var platform = detectPlatform(link);
     log('processOneLink: [' + platform + '] ' + link);
 
-    var data;
-    var isXhs = false;
-
-    // 小红书：优先走专有解析
-    if (platform === 'xiaohongshu') {
-      try {
-        var xhsResult = await processXhsLink(link, cfWorker, useBuiltin);
-        var sharerName = await getSharerName();
-        var xhsText = formatXhsText(xhsResult.note, xhsResult.comments, sharerName);
-        // 注入文本
-        var newTextMsg = await injectTextMessage(msg, xhsText);
-        // 下载图片
-        var imgOk = 0, imgFail = 0;
-        var imageMsgIds = [];
-        for (var i = 0; i < xhsResult.images.length; i++) {
-          try {
-            var dataUrl = await downloadImageAsDataUrl(xhsResult.images[i].url, cfWorker, useBuiltin);
-            var imgMsg = await injectImageMessage(newTextMsg, dataUrl, i);
-            imageMsgIds.push(imgMsg.id);
-            imgOk++;
-          } catch (e) { imgFail++; }
-        }
-        log('processOneLink: XHS专有解析成功, 图片 ' + imgOk + '/' + (imgOk + imgFail));
-        return { textMsgId: newTextMsg.id, imageMsgIds: imageMsgIds, imgOk: imgOk, imgFail: imgFail, platform: platform };
-      } catch (e) {
-        log('processOneLink: XHS专有解析失败 (' + e.message + '), 降级到后端通用解析', 'warn');
-      }
-    }
-
-    // 通用解析（非XHS 或 XHS降级）
-    data = await parseLink(link, backend);
+    var data = await parseLink(link, backend);
     var platformName = data.platform || platform;
     var text = formatParsedResult(data, platformName, link);
 
-    // 注入文本
     var textMsg = await injectTextMessage(msg, text);
-
-    // 下载图片
     var images = extractImagesFromData(data);
     var ok = 0, fail = 0;
     var imgIds = [];
-    for (var j = 0; j < images.length; j++) {
+    for (var i = 0; i < images.length; i++) {
       try {
-        var dUrl = await downloadImageAsDataUrl(images[j].url, cfWorker, useBuiltin);
-        var im = await injectImageMessage(textMsg, dUrl, j);
+        var dUrl = await downloadImageAsDataUrl(images[i].url, cfWorker, useBuiltin);
+        var im = await injectImageMessage(textMsg, dUrl, i);
         imgIds.push(im.id);
         ok++;
       } catch (e) { fail++; }
     }
-    log('processOneLink: 后端通用解析成功, 图片 ' + ok + '/' + (ok + fail));
+    log('processOneLink: 解析成功, 图片 ' + ok + '/' + (ok + fail));
     return { textMsgId: textMsg.id, imageMsgIds: imgIds, imgOk: ok, imgFail: fail, platform: platformName };
   }
 
@@ -739,12 +599,24 @@
         }
       } catch (e) {}
 
-      // 读最新 3 条消息
+      // 读最新 3 条消息（优先 roche API，失败则 IndexedDB 直读兜底）
       var msgs = [];
       try {
         var result = await rocheRef.memory.getShortTerm({ conversationId: convId, limit: 3 });
         msgs = Array.isArray(result) ? result : (result && result.messages) || [];
-      } catch (e) { return; }
+      } catch (e) {
+        log('pollOnce: getShortTerm 失败 (' + e.message + '), 尝试 IndexedDB 兜底', 'warn');
+        try {
+          var dbMsgs = await getMessagesByConversation(convId);
+          if (dbMsgs && dbMsgs.length > 0) {
+            msgs = dbMsgs.slice(-3);
+            log('pollOnce: IndexedDB 兜底成功, 获取到 ' + msgs.length + ' 条', 'info');
+          }
+        } catch (e2) {
+          log('pollOnce: IndexedDB 兜底也失败 (' + e2.message + ')', 'error');
+          return;
+        }
+      }
       if (msgs.length === 0) return;
 
       var m = msgs[msgs.length - 1];
