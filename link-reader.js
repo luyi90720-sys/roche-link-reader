@@ -1,5 +1,5 @@
 /**
- * Roche 链接解析插件 v2.3.3
+ * Roche 链接解析插件 v2.3.4
  *
  * 纯后台监听当前打开的聊天会话（从 viewStack 自动读取），检测到各平台链接后：
  *   1. 小红书：优先走专用 HTML 抓取（__INITIAL_STATE__ 提取标题/正文/评论/图片），
@@ -69,6 +69,17 @@
   // ============================ 运行时状态 ============================
   var rocheRef = null;
   var rocheStorage = null;
+
+  // 兜底：即使 mount() 未调用也能从 window.Roche 获取引用
+  function ensureRoche() {
+    if (!rocheRef && typeof window !== 'undefined' && window.Roche) {
+      rocheRef = window.Roche;
+      rocheStorage = window.Roche.storage;
+      log('ensureRoche: 从 window.Roche 兜底初始化', 'info');
+    }
+    return !!rocheRef;
+  }
+
   var pollTimer = null;
   var isPolling = false;
   var rootEl = null;
@@ -599,6 +610,7 @@
     if (processedLinksLoaded) return;
     processedLinksLoaded = true;
     try {
+      if (!rocheStorage) ensureRoche();
       if (rocheStorage) {
         var saved = await rocheStorage.get(SK.processedLinks);
         if (saved && typeof saved === 'object') Object.assign(processedLinks, saved);
@@ -607,7 +619,10 @@
   }
 
   async function saveProcessedLinks() {
-    try { if (rocheStorage) await rocheStorage.set(SK.processedLinks, processedLinks); } catch (e) {}
+    try {
+      if (!rocheStorage) ensureRoche();
+      if (rocheStorage) await rocheStorage.set(SK.processedLinks, processedLinks);
+    } catch (e) {}
   }
 
   /**
@@ -619,6 +634,7 @@
   async function getUserPersona() {
     if (_cachedUserPersona) return _cachedUserPersona;
     try {
+      if (!rocheRef || !rocheRef.persona) ensureRoche();
       if (rocheRef && rocheRef.persona && rocheRef.persona.getActiveUserPersona) {
         _cachedUserPersona = await rocheRef.persona.getActiveUserPersona();
       }
@@ -631,6 +647,8 @@
    */
   async function findMessageByText(convId, linkText) {
     try {
+      if (!rocheRef || !rocheRef.memory) ensureRoche();
+      if (!rocheRef || !rocheRef.memory) return null;
       var result = await rocheRef.memory.getShortTerm({ conversationId: convId, limit: 10 });
       var msgs = Array.isArray(result) ? result : (result && result.messages) || [];
       // 从最新往前找，匹配包含该链接的消息
@@ -656,6 +674,7 @@
     // 读取设置
     var useBuiltin = true, cfWorker = null, backend = DEFAULT_BACKEND;
     try {
+      if (!rocheStorage) ensureRoche();
       if (rocheStorage) {
         var v = await rocheStorage.get(SK.useBuiltinProxy);
         if (v !== null && v !== undefined) useBuiltin = v !== false && v !== '0' && v !== 0;
@@ -712,6 +731,33 @@
       notify('处理失败: ' + e.message, 'error');
       delete processedLinks[dedupKey];
     }
+  }
+
+  /**
+   * contextProvider 触发的异步处理调度器
+   * 不依赖 mount()/pollTimer，在 contextProvider 检测到链接后直接 setTimeout 处理
+   */
+  var _processScheduled = false;
+  function scheduleProcessContext() {
+    if (_processScheduled) return;
+    _processScheduled = true;
+    setTimeout(async function() {
+      try {
+        ensureRoche();
+        runtimeStats.queueSize = pendingLinks.length;
+        while (pendingLinks.length > 0) {
+          var item = pendingLinks.shift();
+          try {
+            await processPendingLink(item);
+            runtimeStats.injectedCount++;
+          } catch (e) {
+            log('scheduleProcessContext: 处理失败 (' + e.message + ')', 'error');
+          }
+        }
+      } finally {
+        _processScheduled = false;
+      }
+    }, 300);
   }
 
   async function pollOnce() {
@@ -1254,7 +1300,7 @@
   window.RochePlugin.register({
     id: PLUGIN_ID,
     name: '链接解析',
-    version: '2.3.3',
+    version: '2.3.4',
     apps: [{
       id: APP_ID,
       name: '链接解析',
@@ -1297,6 +1343,8 @@
           rawText: ctx.latestUserMessage,
           ts: Date.now()
         });
+        // 直接触发异步处理，不等待 mount()/pollTimer
+        scheduleProcessContext();
         return null;
       }
     }
