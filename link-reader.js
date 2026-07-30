@@ -1,7 +1,7 @@
 /**
- * Roche 链接解析插件 v2.3.5
+ * Roche 链接解析插件 v2.3.6
  *
- * 纯后台监听（通过 roche.conversation.list() 遍历所有会话 + getShortTerm 取最后1条 + 时间戳追踪），检测到各平台链接后：
+ * 纯后台监听（通过 roche.conversation.list() 遍历所有会话 + getShortTerm 取最后2条 + 只追踪用户消息时间戳），检测到各平台链接后：
  *   1. 小红书：优先走专用 HTML 抓取（__INITIAL_STATE__ 提取标题/正文/评论/图片），
  *      失败后降级走后端 /?url= 通用解析
  *   2. B站/微博/抖音/知乎/通用：走后端 /?url= 通用解析获取 JSON
@@ -831,7 +831,7 @@
       // 获取用户人设（缓存，用于 isMe 判断）
       var user = await getUserPersona();
 
-      // 遍历所有会话，只取每条会话最新 1 条消息，追踪时间戳变化
+      // 遍历所有会话，取最后 2 条消息，只追踪用户消息的时间戳变化
       var conversations = await getConversationList();
       runtimeStats.lastPollMsgCount = conversations.length;
       runtimeStats.lastPollTime = new Date().toLocaleTimeString('zh-CN', { hour12: false });
@@ -841,51 +841,54 @@
         var convId = c.id || c.conversationId;
         if (!convId) continue;
 
-        // 记录会话 ID 来源信息
         if (i === 0) {
           cachedConvId = convId;
           runtimeStats.lastPollConvId = convId;
           runtimeStats.convIdSource = 'conversation.list';
         }
 
-        // 取该会话最新 1 条消息
+        // 取最后 2 条消息
         var msgs = [];
         try {
-          var result = await rocheRef.memory.getShortTerm({ conversationId: convId, limit: 1 });
+          var result = await rocheRef.memory.getShortTerm({ conversationId: convId, limit: 2 });
           msgs = Array.isArray(result) ? result : (result && result.messages) || [];
         } catch (e) { continue; }
         if (msgs.length === 0) continue;
 
-        var m = msgs[0];
-        var ts = m.timestamp || 0;
+        // 从最新往前找，定位用户消息
+        var userMsg = null;
+        for (var j = msgs.length - 1; j >= 0; j--) {
+          var m = msgs[j];
+          var isMe = false;
+          if (user) {
+            isMe = (m.senderId && (m.senderId === user.id || m.senderId === user.handle)) ||
+                   (m.senderHandle && m.senderHandle === user.handle) ||
+                   (m.senderName && m.senderName === user.name);
+          }
+          if (!isMe && m.type !== 'assistant' && !m.senderId && !m.senderName) {
+            isMe = true;
+          }
+          if (isMe) { userMsg = m; break; }
+        }
+        if (!userMsg) continue;
 
-        // 跳过已见过的消息
+        // 只追踪用户消息的时间戳变化
+        var ts = userMsg.timestamp || 0;
         if (ts <= (_lastSeenTs[convId] || 0)) continue;
         _lastSeenTs[convId] = ts;
 
-        // 判断是否用户消息
-        var isMe = false;
-        if (user) {
-          isMe = (m.senderId && (m.senderId === user.id || m.senderId === user.handle)) ||
-                 (m.senderHandle && m.senderHandle === user.handle) ||
-                 (m.senderName && m.senderName === user.name);
-        }
-        if (!isMe && m.type !== 'assistant' && !m.senderId && !m.senderName) {
-          isMe = true;
-        }
-        if (!isMe) continue;
-        if (m.type && m.type !== 'text') continue;
+        if (userMsg.type && userMsg.type !== 'text') continue;
 
         runtimeStats.lastPollIsMe = true;
         runtimeStats.lastPollHasLink = false;
         runtimeStats.lastPollLink = null;
 
-        var msgText = m.text || m.content || '';
+        var msgText = userMsg.text || userMsg.content || '';
         var links = extractLinks(msgText);
         if (links.length > 0) {
           runtimeStats.lastPollHasLink = true;
           runtimeStats.lastPollLink = cleanLink(links[0]).substring(0, 60);
-          await processSingleMessage(m, convId, backend, cfWorker, useBuiltin);
+          await processSingleMessage(userMsg, convId, backend, cfWorker, useBuiltin);
         }
       }
     } finally {
@@ -1311,7 +1314,7 @@
   window.RochePlugin.register({
     id: PLUGIN_ID,
     name: '链接解析',
-    version: '2.3.5',
+    version: '2.3.6',
     apps: [{
       id: APP_ID,
       name: '链接解析',
