@@ -1,10 +1,10 @@
 {
   "id": "roche-link-reader",
   "name": "链接解析",
-  "version": "1.0.1",
-  "description": "解析小红书/微博/B站/知乎链接，支持图片注入和三种注入模式",
+  "version": "2.0.0",
+  "description": "解析小红书/微博/B站/知乎链接，纯直注模式，只监听当前会话，关闭面板后后台继续运行",
   "author": "Roche",
   "entry": "https://raw.githubusercontent.com/yechen1844/roche-link-reader/main/link-reader.js",
   "hash": "",
-  "permissions": ["memory:read", "ai:chat", "storage", "ui"]
+  "permissions": ["memory:read", "storage", "ui"]
 }
