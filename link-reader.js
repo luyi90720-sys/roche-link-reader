@@ -75,6 +75,8 @@
   var injectedStyleEl = null;
   var processedLinks = {};
   var processedLinksLoaded = false;
+  var pendingLinks = [];       // contextProvider 检测到的待处理链接
+  var cachedConvId = null;     // contextProvider 缓存的当前会话 ID
 
   // ============================ 日志 ============================
   var logs = [];
@@ -580,48 +582,164 @@
     try { if (rocheStorage) await rocheStorage.set(SK.processedLinks, processedLinks); } catch (e) {}
   }
 
+  /**
+   * 获取当前用户人设（缓存），用于可靠 isMe 判断
+   * 根据官方指南：getShortTerm 返回 senderId / senderName / senderHandle，
+   * 没有 isMe 字段。需对比用户人设来判断。
+   */
+  var _cachedUserPersona = null;
+  async function getUserPersona() {
+    if (_cachedUserPersona) return _cachedUserPersona;
+    try {
+      if (rocheRef && rocheRef.persona && rocheRef.persona.getActiveUserPersona) {
+        _cachedUserPersona = await rocheRef.persona.getActiveUserPersona();
+      }
+    } catch (e) {}
+    return _cachedUserPersona;
+  }
+
+  /**
+   * 从 getShortTerm 消息队列中查找匹配指定文本的消息（contextProvider 回调用）
+   */
+  async function findMessageByText(convId, linkText) {
+    try {
+      var result = await rocheRef.memory.getShortTerm({ conversationId: convId, limit: 10 });
+      var msgs = Array.isArray(result) ? result : (result && result.messages) || [];
+      // 从最新往前找，匹配包含该链接的消息
+      for (var i = msgs.length - 1; i >= 0; i--) {
+        var m = msgs[i];
+        var text = m.text || m.content || '';
+        if (text.indexOf(linkText) !== -1) return m;
+      }
+    } catch (e) {
+      log('findMessageByText 失败: ' + e.message, 'warn');
+    }
+    return null;
+  }
+
+  /**
+   * 处理 contextProvider 入队的链接
+   */
+  async function processPendingLink(item) {
+    var convId = item.convId;
+    var link = item.link;
+    cachedConvId = convId;
+
+    // 读取设置
+    var useBuiltin = true, cfWorker = null, backend = DEFAULT_BACKEND;
+    try {
+      if (rocheStorage) {
+        var v = await rocheStorage.get(SK.useBuiltinProxy);
+        if (v !== null && v !== undefined) useBuiltin = v !== false && v !== '0' && v !== 0;
+        cfWorker = await rocheStorage.get(SK.cfWorker) || null;
+        var b = await rocheStorage.get(SK.backend);
+        if (b) backend = b;
+      }
+    } catch (e) {}
+
+    // 去重：检查是否已处理
+    await loadProcessedLinks();
+    var dedupKey = convId + '_link_' + link;
+    if (processedLinks[dedupKey] && processedLinks[dedupKey].done) return;
+    if (processedLinks[dedupKey] && processedLinks[dedupKey].processing) return;
+
+    processedLinks[dedupKey] = { processing: true, ts: Date.now() };
+
+    // 从 getShortTerm 查找真实消息对象（获取 id / timestamp）
+    var m = await findMessageByText(convId, link);
+    var msgId, msgText, msgTs;
+    if (m) {
+      msgId = m.id || m.messageId || (convId + '_' + m.timestamp);
+      msgText = m.text || m.content || item.rawText;
+      msgTs = m.timestamp || Date.now();
+    } else {
+      // 备用：用 contextProvider 的信息构造
+      msgId = convId + '_ctx_' + Date.now();
+      msgText = item.rawText;
+      msgTs = Date.now();
+    }
+
+    var platform = detectPlatform(link);
+    notify('检测到' + (PLATFORM_NAMES[platform] || '网页') + '链接，开始解析...', 'info');
+
+    try {
+      var fakeMsg = {
+        id: msgId, text: msgText, isMe: true, type: 'text',
+        timestamp: msgTs, conversationId: convId
+      };
+      if (m && m.senderId !== undefined) fakeMsg.senderId = m.senderId;
+      if (m && m.senderName !== undefined) fakeMsg.senderName = m.senderName;
+
+      var procResult = await processOneLink(fakeMsg, link, backend, cfWorker, useBuiltin);
+
+      processedLinks[dedupKey] = {
+        done: true, ts: Date.now(), injectTs: msgTs,
+        convId: convId, textMsgId: procResult.textMsgId, imageMsgIds: procResult.imageMsgIds
+      };
+      await saveProcessedLinks();
+
+      notify('注入成功 (图片 ' + procResult.imgOk + '/' + (procResult.imgOk + procResult.imgFail) + ')', 'success');
+      await refreshRocheChat(convId);
+    } catch (e) {
+      notify('处理失败: ' + e.message, 'error');
+      delete processedLinks[dedupKey];
+    }
+  }
+
   async function pollOnce() {
     if (isPolling) return;
     isPolling = true;
     try {
-      var convId = getCurrentConversationId();
+      // 优先处理 contextProvider 入队的链接（最可靠的检测来源）
+      while (pendingLinks.length > 0) {
+        var item = pendingLinks.shift();
+        try {
+          await processPendingLink(item);
+        } catch (e) {
+          log('processPendingLink 异常: ' + e.message, 'error');
+        }
+      }
+
+      // 兜底：getShortTerm 轮询（contextProvider 可能未触发的情况）
+      var convId = cachedConvId || getCurrentConversationId();
       if (!convId) return;
 
-      // 读取设置
       var useBuiltin = true, cfWorker = null, backend = DEFAULT_BACKEND;
       try {
         if (rocheStorage) {
-          var v = await rocheStorage.get(SK.useBuiltinProxy);
-          if (v !== null && v !== undefined) useBuiltin = v !== false && v !== '0' && v !== 0;
+          var v2 = await rocheStorage.get(SK.useBuiltinProxy);
+          if (v2 !== null && v2 !== undefined) useBuiltin = v2 !== false && v2 !== '0' && v2 !== 0;
           cfWorker = await rocheStorage.get(SK.cfWorker) || null;
-          var b = await rocheStorage.get(SK.backend);
-          if (b) backend = b;
+          var b2 = await rocheStorage.get(SK.backend);
+          if (b2) backend = b2;
         }
       } catch (e) {}
 
-      // 读最新 3 条消息（优先 roche API，失败则 IndexedDB 直读兜底）
       var msgs = [];
       try {
         var result = await rocheRef.memory.getShortTerm({ conversationId: convId, limit: 3 });
         msgs = Array.isArray(result) ? result : (result && result.messages) || [];
       } catch (e) {
-        log('pollOnce: getShortTerm 失败 (' + e.message + '), 尝试 IndexedDB 兜底', 'warn');
-        try {
-          var dbMsgs = await getMessagesByConversation(convId);
-          if (dbMsgs && dbMsgs.length > 0) {
-            msgs = dbMsgs.slice(-3);
-            log('pollOnce: IndexedDB 兜底成功, 获取到 ' + msgs.length + ' 条', 'info');
-          }
-        } catch (e2) {
-          log('pollOnce: IndexedDB 兜底也失败 (' + e2.message + ')', 'error');
-          return;
-        }
+        log('pollOnce: getShortTerm 失败 (' + e.message + '), 跳过本轮', 'warn');
+        return;
       }
       if (msgs.length === 0) return;
 
       var m = msgs[msgs.length - 1];
-      var isMe = m.isMe === true || m.senderId === 'me' || m.role === 'user' ||
-                 (m.senderName === undefined && m.type !== 'assistant');
+
+      // 正确判断是否用户消息：对比用户人设的 id/name/handle
+      // getShortTerm 不返回 isMe/role，只有 senderId/senderName/senderHandle
+      var isMe = false;
+      var user = await getUserPersona();
+      if (user) {
+        isMe = (m.senderId && (m.senderId === user.id || m.senderId === user.handle)) ||
+               (m.senderHandle && m.senderHandle === user.handle) ||
+               (m.senderName && m.senderName === user.name);
+      }
+      // 兜底：type 不为 'assistant' 且 senderName 为空（用户消息通常没有 senderName）
+      if (!isMe && m.type !== 'assistant' && !m.senderId && !m.senderName) {
+        isMe = true;
+      }
       if (!isMe) return;
       if (m.type && m.type !== 'text') return;
 
@@ -629,7 +747,6 @@
       var links = extractLinks(msgText);
       if (links.length === 0) return;
 
-      // 取第一个链接
       var link = cleanLink(links[0]);
       var msgId = m.id || m.messageId || (convId + '_' + m.timestamp);
       var key = convId + '_' + msgId;
@@ -990,7 +1107,7 @@
   window.RochePlugin.register({
     id: PLUGIN_ID,
     name: '链接解析',
-    version: '2.3.0',
+    version: '2.3.2',
     apps: [{
       id: APP_ID,
       name: '链接解析',
@@ -1005,7 +1122,34 @@
         rootEl = null;
         container.replaceChildren();
       }
-    }]
+    }],
+    chat: {
+      // contextProvider：由 Roche 每轮聊天自动调用，可靠获取 conversationId + 最新用户消息
+      // 不注入任何上下文到 system prompt，仅用于链接检测
+      contextProvider: function(ctx) {
+        if (!ctx || !ctx.latestUserMessage || !ctx.conversationId) return null;
+        var links = extractLinks(ctx.latestUserMessage);
+        if (links.length === 0) return null;
+        var link = cleanLink(links[0]);
+        if (!link) return null;
+
+        // 缓存当前会话 ID（供 pollOnce 兜底使用）
+        cachedConvId = ctx.conversationId;
+
+        // 检查是否已处理过
+        var dedupKey = ctx.conversationId + '_link_' + link;
+        if (processedLinks[dedupKey] && (processedLinks[dedupKey].done || processedLinks[dedupKey].processing)) return null;
+
+        // 入队待处理
+        pendingLinks.push({
+          convId: ctx.conversationId,
+          link: link,
+          rawText: ctx.latestUserMessage,
+          ts: Date.now()
+        });
+        return null;
+      }
+    }
   });
 
 })();
