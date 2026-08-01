@@ -1,5 +1,7 @@
 /**
- * Roche 链接解析插件 v3.0.1
+ * Roche 链接解析插件 v3.0.3
+ *
+ * v3.0.3：移除解析结果中的图片数量提示（不再向 char 声明"图片已省略"），纯文字返回，沉浸感更好
  *
  * v3.0.1：工具 storage 读取加 1s 超时兜底，避免 storage 未就绪时挂起导致工具调用 504
  *
@@ -20,7 +22,7 @@
   // ============================ 常量 ============================
   var PLUGIN_ID = 'roche-link-reader';
   var APP_ID = 'roche-link-reader-home';
-  var VERSION = '3.0.2';
+  var VERSION = '3.0.3';
 
   // 默认后端（国内可直连 CF Worker 自定义域名）
   var DEFAULT_BACKEND = 'https://456.chajianreader.cc.cd';
@@ -166,13 +168,6 @@
 
     // 视频标记
     if (data.video) lines.push('（含视频内容）');
-
-    // 图片数量提示（只报数量，不下载图片）
-    var imgCount = 0;
-    if (data.images && data.images.length) imgCount = data.images.length;
-    else if (data.imageList && data.imageList.length) imgCount = data.imageList.length;
-    else if (data.pics && data.pics.length) imgCount = data.pics.length;
-    if (imgCount > 0) lines.push('（该内容包含 ' + imgCount + ' 张图片，已按文字模式省略图片）');
 
     lines.push('');
     lines.push('原始链接：' + link);
