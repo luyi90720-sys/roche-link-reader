@@ -1,5 +1,7 @@
 /**
- * Roche 链接解析插件 v3.0.0
+ * Roche 链接解析插件 v3.0.1
+ *
+ * v3.0.1：工具 storage 读取加 1s 超时兜底，避免 storage 未就绪时挂起导致工具调用 504
  *
  * v3.0.0 完全重写：
  *   - 纯文字模式：不再下载/注入图片，不替换原消息，不操作主数据库
@@ -18,7 +20,7 @@
   // ============================ 常量 ============================
   var PLUGIN_ID = 'roche-link-reader';
   var APP_ID = 'roche-link-reader-home';
-  var VERSION = '3.0.0';
+  var VERSION = '3.0.1';
 
   // 默认后端（国内可直连 CF Worker 自定义域名）
   var DEFAULT_BACKEND = 'https://456.chajianreader.cc.cd';
@@ -86,7 +88,7 @@
     var base = backend || DEFAULT_BACKEND;
     var url = base.replace(/\/$/, '') + '/?url=' + encodeURIComponent(link);
     var ctrl = new AbortController();
-    var t = setTimeout(function() { ctrl.abort(); }, 25000);
+    var t = setTimeout(function() { ctrl.abort(); }, 12000);
     var resp;
     try {
       resp = await fetch(url, { signal: ctrl.signal });
@@ -221,11 +223,14 @@
     }
     var platform = detectPlatform(link);
 
-    // 读取用户配置的后端地址
+    // 读取用户配置的后端地址（加超时兜底，避免 storage 未就绪时挂起导致工具超时）
     var backend = DEFAULT_BACKEND;
     try {
       if (typeof window !== 'undefined' && window.Roche && window.Roche.storage) {
-        var saved = await window.Roche.storage.get(SK.backend);
+        var saved = await Promise.race([
+          window.Roche.storage.get(SK.backend),
+          new Promise(function(res) { setTimeout(function() { res(undefined); }, 1000); })
+        ]);
         if (saved) backend = saved;
       }
     } catch (e) {}
