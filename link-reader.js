@@ -20,7 +20,7 @@
   // ============================ 常量 ============================
   var PLUGIN_ID = 'roche-link-reader';
   var APP_ID = 'roche-link-reader-home';
-  var VERSION = '3.0.1';
+  var VERSION = '3.0.2';
 
   // 默认后端（国内可直连 CF Worker 自定义域名）
   var DEFAULT_BACKEND = 'https://456.chajianreader.cc.cd';
@@ -164,22 +164,6 @@
       }
     }
 
-    // B站字幕（data.subtitle/subtitles 是对象 {available, text, srt} 或字符串）
-    var subSrc = data.subtitle || data.subtitles;
-    if (subSrc) {
-      var subText = '';
-      if (typeof subSrc === 'object' && subSrc) {
-        subText = subSrc.text || subSrc.srt || '';
-      } else if (typeof subSrc === 'string') {
-        subText = subSrc;
-      }
-      if (subText) {
-        lines.push('');
-        lines.push('【字幕内容】');
-        lines.push(subText);
-      }
-    }
-
     // 视频标记
     if (data.video) lines.push('（含视频内容）');
 
@@ -303,7 +287,7 @@
       '    不再自动注入、不再下载图片、不替换原消息。支持平台：</div>',
       '    <div style="margin-top:8px;">',
       '      <span class="rlr-plat">微博</span><span class="rlr-plat">小红书</span><span class="rlr-plat">知乎</span>',
-      '      <span class="rlr-plat">抖音</span><span class="rlr-plat">B站(含字幕)</span><span class="rlr-plat">贴吧</span>',
+      '      <span class="rlr-plat">抖音</span><span class="rlr-plat">B站</span><span class="rlr-plat">贴吧</span>',
       '      <span class="rlr-plat">豆瓣</span><span class="rlr-plat">通用网页</span>',
       '    </div>',
       '  </div>',
@@ -329,7 +313,7 @@
       '    <div class="rlr-card-title">\U0001f4a1 给 char 的工具说明</div>',
       '    <div class="rlr-tool-box">',
       '      <b>工具名</b>：parse_link<br>',
-      '      <b>用途</b>：解析用户消息中的链接，返回纯文字内容（含标题/正文/作者/评论/字幕等）<br>',
+      '      <b>用途</b>：解析用户消息中的链接，返回纯文字内容（含标题/正文/作者/评论等）<br>',
       '      <b>参数</b>：link（可选，不传则自动从当前消息提取）',
       '    </div>',
       '  </div>',
@@ -414,7 +398,7 @@
       // 不注入 promptOnly / contextProvider，char 需要时才调用
       tools: [{
         id: 'parse_link',
-        description: '解析用户消息中的链接，返回该链接内容的纯文字摘要（支持微博、小红书、知乎、抖音、B站含字幕、贴吧、豆瓣、通用网页）。当用户发送了链接，或你需要了解链接内容时调用。',
+        description: '解析用户消息中的链接，返回该链接内容的纯文字摘要（支持微博、小红书、知乎、抖音、B站、贴吧、豆瓣、通用网页）。当用户发送了链接，或你需要了解链接内容时调用。',
         parameters: {
           link: 'string'
         },
