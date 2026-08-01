@@ -1,8 +1,8 @@
 {
   "id": "roche-link-reader",
   "name": "链接解析",
-  "version": "3.0.1",
-  "description": "链接解析 v3.0 纯文字模式：声明 parse_link 工具，char 按需调用，将微博/小红书/知乎/抖音/B站(含字幕)/贴吧/豆瓣/通用网页链接解析成文字返回。不注入图片，不替换消息。",
+  "version": "3.0.2",
+  "description": "链接解析 v3.0 纯文字模式：声明 parse_link 工具，char 按需调用，将微博/小红书/知乎/抖音/B站/贴吧/豆瓣/通用网页链接解析成文字返回。不注入图片，不替换消息。",
   "author": "Roche",
   "entry": "https://raw.githubusercontent.com/yechen1844/roche-link-reader/main/link-reader.js",
   "hash": "",
